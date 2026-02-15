@@ -7,7 +7,12 @@
     [string]$OllamaModel = "qwen2.5:7b-instruct",
     [int]$StreamlitPort = 9531,
     [int]$HealthPort = 9540,
-    [string]$LogDir = ".\\logs"
+    [string]$LogDir = ".\\logs",
+    [ValidateSet("all", "bot", "web", "llm", "db")]
+    [string]$Components = "all",
+    [switch]$SkipLocalPostgresInstall,
+    [switch]$SkipLocalOllamaInstall,
+    [switch]$SkipServiceInstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,27 +51,42 @@ function Ensure-WingetPackage {
     }
 }
 
-Write-Host "1/9 Installing dependencies (Python, Ollama, PostgreSQL)..."
-Ensure-WingetPackage -Id "Python.Python.3.11"
-Ensure-WingetPackage -Id "Ollama.Ollama"
-Ensure-WingetPackage -Id "PostgreSQL.PostgreSQL"
+$needPython = ($Components -in @("all", "bot", "web"))
+$needDb = ($Components -in @("all", "bot", "web", "db"))
 
-Write-Host "2/9 Setting up Python environment..."
+Write-Host "1/9 Installing dependencies (component-aware)..."
+Ensure-WingetPackage -Id "Python.Python.3.11"
+if (-not $SkipLocalOllamaInstall) {
+    Ensure-WingetPackage -Id "Ollama.Ollama"
+}
+if ($needDb -and -not $SkipLocalPostgresInstall) {
+    Ensure-WingetPackage -Id "PostgreSQL.PostgreSQL"
+}
+
 Push-Location $AppDir
-& ".\\scripts\\setup_local_test_env.ps1" -VenvPath $VenvPath
-$pythonExe = Join-Path $VenvPath "Scripts\\python.exe"
-if (-not (Test-Path $pythonExe)) {
-    throw "Python executable not found in venv: $pythonExe"
+if ($needPython) {
+    Write-Host "2/9 Setting up Python environment..."
+    & ".\\scripts\\setup_local_test_env.ps1" -VenvPath $VenvPath
+    $pythonExe = Join-Path $VenvPath "Scripts\\python.exe"
+    if (-not (Test-Path $pythonExe)) {
+        throw "Python executable not found in venv: $pythonExe"
+    }
+} else {
+    Write-Host "2/9 Skipping Python app environment for llm-only install..."
 }
 
 Write-Host "3/9 Configuring .env defaults..."
 $envFile = Join-Path $AppDir ".env"
-Set-DotEnvValue -Path $envFile -Key "AIGM_DATABASE_URL" -Value "postgresql+psycopg://$DbUser`:$DbPassword@localhost:5432/$DbName"
+if (-not $SkipLocalPostgresInstall) {
+    Set-DotEnvValue -Path $envFile -Key "AIGM_DATABASE_URL" -Value "postgresql+psycopg://$DbUser`:$DbPassword@localhost:5432/$DbName"
+}
 Set-DotEnvValue -Path $envFile -Key "AIGM_DATABASE_SSLMODE" -Value "prefer"
 Set-DotEnvValue -Path $envFile -Key "AIGM_DATABASE_CONNECT_TIMEOUT_S" -Value "10"
-Set-DotEnvValue -Path $envFile -Key "AIGM_LLM_PROVIDER" -Value "ollama"
-Set-DotEnvValue -Path $envFile -Key "AIGM_OLLAMA_URL" -Value "http://127.0.0.1:11434"
-Set-DotEnvValue -Path $envFile -Key "AIGM_OLLAMA_MODEL" -Value $OllamaModel
+if (-not $SkipLocalOllamaInstall) {
+    Set-DotEnvValue -Path $envFile -Key "AIGM_LLM_PROVIDER" -Value "ollama"
+    Set-DotEnvValue -Path $envFile -Key "AIGM_OLLAMA_URL" -Value "http://127.0.0.1:11434"
+    Set-DotEnvValue -Path $envFile -Key "AIGM_OLLAMA_MODEL" -Value $OllamaModel
+}
 Set-DotEnvValue -Path $envFile -Key "AIGM_AUTH_ENFORCE" -Value "false"
 Set-DotEnvValue -Path $envFile -Key "AIGM_STREAMLIT_PORT" -Value "$StreamlitPort"
 Set-DotEnvValue -Path $envFile -Key "AIGM_HEALTHCHECK_PORT" -Value "$HealthPort"
@@ -77,52 +97,96 @@ Set-DotEnvValue -Path $envFile -Key "AIGM_LOG_FILE_BACKUP_COUNT" -Value "5"
 Set-DotEnvValue -Path $envFile -Key "AIGM_LOG_DB_BATCH_SIZE" -Value "50"
 Set-DotEnvValue -Path $envFile -Key "AIGM_LOG_DB_FLUSH_INTERVAL_S" -Value "2"
 
-Write-Host "4/9 Starting Ollama and pulling model..."
-try {
-    ollama list | Out-Null
-} catch {
-    Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
-    Start-Sleep -Seconds 2
-}
-ollama pull $OllamaModel
-
-Write-Host "5/9 Configuring PostgreSQL DB/user (best effort)..."
-$psql = Get-Command psql -ErrorAction SilentlyContinue
-if ($psql) {
+if (-not $SkipLocalOllamaInstall) {
+    Write-Host "4/9 Starting Ollama and pulling model..."
     try {
-        & psql -U postgres -h localhost -d postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$DbUser') THEN CREATE ROLE $DbUser LOGIN PASSWORD '$DbPassword'; END IF; END \$\$;"
-        & psql -U postgres -h localhost -d postgres -c "SELECT 'CREATE DATABASE $DbName OWNER $DbUser' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DbName')\gexec"
+        ollama list | Out-Null
     } catch {
-        Write-Warning "Automatic PostgreSQL role/database creation failed. Create user/database manually if needed."
+        Start-Process -FilePath "ollama" -ArgumentList "serve" -WindowStyle Hidden
+        Start-Sleep -Seconds 2
+    }
+    ollama pull $OllamaModel
+} else {
+    Write-Host "4/9 Skipping local Ollama setup..."
+}
+
+if ($needDb -and -not $SkipLocalPostgresInstall) {
+    Write-Host "5/9 Configuring PostgreSQL DB/user (best effort)..."
+    $psql = Get-Command psql -ErrorAction SilentlyContinue
+    if ($psql) {
+        try {
+            & psql -U postgres -h localhost -d postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$DbUser') THEN CREATE ROLE $DbUser LOGIN PASSWORD '$DbPassword'; END IF; END \$\$;"
+            & psql -U postgres -h localhost -d postgres -c "SELECT 'CREATE DATABASE $DbName OWNER $DbUser' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '$DbName')\gexec"
+        } catch {
+            Write-Warning "Automatic PostgreSQL role/database creation failed. Create user/database manually if needed."
+        }
+    } else {
+        Write-Warning "psql not found; skipping PostgreSQL DB/user creation."
     }
 } else {
-    Write-Warning "psql not found; skipping PostgreSQL DB/user creation."
+    Write-Host "5/9 Skipping local PostgreSQL setup..."
 }
 
-Write-Host "6/9 Initializing DB schema if needed..."
-& $pythonExe -m aigm.db.bootstrap --required-table campaigns --required-table system_logs --required-table bot_configs
+if ($needPython) {
+    Write-Host "6/9 Validating DB schema and backend defaults..."
+    & $pythonExe -m aigm.db.bootstrap
+    & $pythonExe -c "from aigm.adapters.llm import LLMAdapter; from aigm.db.session import SessionLocal; from aigm.services.game_service import GameService; s=GameService(LLMAdapter()); db=SessionLocal(); s.seed_default_auth(db); s.seed_default_agency_rules(db); s.seed_default_gameplay_knowledge(db); db.close(); print('[install] backend defaults validated')"
+} else {
+    Write-Host "6/9 Skipping Python bootstrap for llm-only install..."
+}
 
-Write-Host "7/9 Writing service runner script..."
-$supervisorRunner = Join-Path $AppDir "scripts\\run_supervisor_service.ps1"
-$logDirPath = Join-Path $AppDir $LogDir
+$runner = ""
+if ($needPython) {
+    Write-Host "7/9 Writing service runner script..."
+    $runner = Join-Path $AppDir "scripts\\run_component_service.ps1"
+    $logDirPath = Join-Path $AppDir $LogDir
+    $runCmd = ""
+    if ($Components -eq "all") {
+        $runCmd = "& '$pythonExe' -m aigm.ops.supervisor --streamlit-port $StreamlitPort --health-port $HealthPort --log-dir '$logDirPath' --cwd '$AppDir'"
+    } elseif ($Components -eq "bot") {
+        $runCmd = "& '$pythonExe' -m aigm.ops.bot_manager --cwd '$AppDir'"
+    } elseif ($Components -eq "web") {
+        $runCmd = "& '$pythonExe' -m streamlit run streamlit_app.py --server.port $StreamlitPort --server.headless true"
+    }
 @"
 `$ErrorActionPreference = 'Stop'
 Set-Location '$AppDir'
 if (-not (Test-Path '$logDirPath')) { New-Item -ItemType Directory -Force -Path '$logDirPath' | Out-Null }
-& '$pythonExe' -m aigm.ops.supervisor --streamlit-port $StreamlitPort --health-port $HealthPort --log-dir '$logDirPath' --cwd '$AppDir'
-"@ | Set-Content -Path $supervisorRunner -Encoding UTF8
+$runCmd
+"@ | Set-Content -Path $runner -Encoding UTF8
+}
 
-Write-Host "8/9 Registering Windows service..."
-sc.exe stop aigm-supervisor 2>$null | Out-Null
-sc.exe delete aigm-supervisor 2>$null | Out-Null
-$supBin = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$supervisorRunner`""
-sc.exe create aigm-supervisor binPath= "$supBin" start= auto DisplayName= "AI GameMaster Supervisor" | Out-Null
+if (-not $SkipServiceInstall -and $needPython) {
+    Write-Host "8/9 Registering Windows service..."
+    $serviceName = "aigm-supervisor"
+    $displayName = "AI GameMaster Supervisor"
+    if ($Components -eq "bot") {
+        $serviceName = "aigm-bot-manager"
+        $displayName = "AI GameMaster Bot Manager"
+    } elseif ($Components -eq "web") {
+        $serviceName = "aigm-web"
+        $displayName = "AI GameMaster Web"
+    }
+    sc.exe stop $serviceName 2>$null | Out-Null
+    sc.exe delete $serviceName 2>$null | Out-Null
+    $supBin = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$runner`""
+    sc.exe create $serviceName binPath= "$supBin" start= auto DisplayName= "$displayName" | Out-Null
 
-Write-Host "9/9 Starting service..."
-sc.exe start aigm-supervisor | Out-Null
+    Write-Host "9/9 Starting service..."
+    sc.exe start $serviceName | Out-Null
+} else {
+    Write-Host "8/9 Skipping service registration/start."
+}
 
 Write-Host "Install complete."
-Write-Host "Check service:"
-Write-Host "  sc query aigm-supervisor"
-Write-Host "  Invoke-RestMethod -Method Get -Uri http://127.0.0.1:$HealthPort/health"
+if (-not $SkipServiceInstall -and $needPython) {
+    if ($Components -eq "all") {
+        Write-Host "  sc query aigm-supervisor"
+        Write-Host "  Invoke-RestMethod -Method Get -Uri http://127.0.0.1:$HealthPort/health"
+    } elseif ($Components -eq "bot") {
+        Write-Host "  sc query aigm-bot-manager"
+    } elseif ($Components -eq "web") {
+        Write-Host "  sc query aigm-web"
+    }
+}
 Pop-Location

@@ -1,0 +1,61 @@
+version: "3.9"
+
+# Optional container deployment.
+# Profiles let you run only selected components:
+#   docker compose --profile bot up -d
+#   docker compose --profile web up -d
+#   docker compose --profile llm up -d
+#   docker compose --profile db up -d
+#   docker compose --profile all up -d
+
+services:
+  postgres:
+    image: postgres:16
+    profiles: ["db", "all"]
+    environment:
+      POSTGRES_DB: aigm
+      POSTGRES_USER: aigm
+      POSTGRES_PASSWORD: aigm_password_change_me
+    ports:
+      - "5432:5432"
+    volumes:
+      - aigm_pgdata:/var/lib/postgresql/data
+
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["llm", "all"]
+    ports:
+      - "11434:11434"
+    volumes:
+      - aigm_ollama:/root/.ollama
+
+  bot:
+    image: python:3.11-slim
+    profiles: ["bot", "all"]
+    working_dir: /app
+    volumes:
+      - ..:/app
+    env_file:
+      - ../.env
+    command: >
+      sh -c "pip install -e .[dev,ui] &&
+             python -m aigm.db.bootstrap &&
+             python -m aigm.ops.bot_manager --cwd /app"
+
+  web:
+    image: python:3.11-slim
+    profiles: ["web", "all"]
+    working_dir: /app
+    volumes:
+      - ..:/app
+    env_file:
+      - ../.env
+    ports:
+      - "9531:9531"
+    command: >
+      sh -c "pip install -e .[dev,ui] &&
+             streamlit run streamlit_app.py --server.port 9531 --server.headless true"
+
+volumes:
+  aigm_pgdata:
+  aigm_ollama:

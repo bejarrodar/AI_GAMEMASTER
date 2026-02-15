@@ -10,8 +10,8 @@ import time
 from dataclasses import dataclass
 
 from aigm.config import settings
-from aigm.db.models import BotConfig
-from aigm.db.session import SessionLocal
+from aigm.ops.component_store import ComponentStore
+from aigm.ops.db_api_client import DBApiClient
 
 
 def _safe_name(value: str) -> str:
@@ -31,18 +31,23 @@ class BotManager:
         self.poll_s = max(2, poll_s)
         self.procs: dict[str, ManagedBotProc] = {}
         self._stop = False
-
-    def _db_enabled_configs(self) -> list[BotConfig]:
-        with SessionLocal() as db:
-            return db.query(BotConfig).filter(BotConfig.is_enabled.is_(True)).order_by(BotConfig.id.asc()).all()
+        self.store = ComponentStore("bot_manager")
+        db_api_url = str(self.store.get("db_api_url", settings.db_api_url)).strip() or settings.db_api_url
+        db_api_token = str(self.store.get("db_api_token", settings.db_api_token)).strip() or settings.db_api_token
+        self.db_api = DBApiClient(base_url=db_api_url, token=db_api_token, timeout_s=10)
+        self.store.set("db_api_url", db_api_url)
+        self.store.set("db_api_token", db_api_token)
 
     def _desired(self) -> list[tuple[str, str, str | None, int | None]]:
-        rows = self._db_enabled_configs()
+        rows = self.db_api.list_bots(enabled_only=True)
         desired: list[tuple[str, str, str | None, int | None]] = []
         for row in rows:
-            if not row.discord_token.strip():
+            token = str(row.get("discord_token", "")).strip()
+            if not token:
                 continue
-            desired.append((f"db:{row.id}", row.name.strip() or f"bot-{row.id}", row.discord_token.strip(), row.id))
+            bot_id = int(row.get("id", 0) or 0)
+            name = str(row.get("name", "")).strip() or f"bot-{bot_id}"
+            desired.append((f"db:{bot_id}", name, token, bot_id))
         if not desired and settings.discord_token.strip():
             desired.append(("env:default", "default", settings.discord_token.strip(), None))
         return desired
@@ -146,4 +151,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

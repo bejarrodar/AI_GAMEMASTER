@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     auth_bootstrap_admin_password: str = ""
     streamlit_port: int = 9531
     healthcheck_port: int = 9540
+    management_api_port: int = 9541
+    db_api_port: int = 9542
+    db_api_url: str = "http://127.0.0.1:9542"
+    db_api_token: str = ""
+    component_state_dir: str = "./component_state"
     healthcheck_url: str = "http://127.0.0.1:9540/health"
     health_log_interval_s: int = 30
     health_alert_consecutive_failures: int = 3

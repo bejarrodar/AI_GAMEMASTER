@@ -14,12 +14,20 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib import request
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import text
 
 from aigm.config import settings
 from aigm.db.models import AdminAuditLog, SystemLog
 from aigm.db.session import SessionLocal
+from aigm.ops.component_store import ComponentStore
+from aigm.ops.db_api_client import DBApiClient
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - OpenAI dependency may be optional in some installs.
+    OpenAI = None
 
 
 def utc_now_iso() -> str:
@@ -68,6 +76,44 @@ def post_json_webhook(url: str, payload: dict, timeout_s: int = 8) -> None:
     )
     with request.urlopen(req, timeout=timeout_s) as _resp:
         return
+
+
+def _read_env_file(env_path: Path) -> dict[str, str]:
+    if not env_path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for raw in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def _upsert_env_values(env_path: Path, updates: dict[str, str]) -> None:
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    if not env_path.exists():
+        env_path.write_text("", encoding="utf-8")
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in lines:
+        stripped = line.strip()
+        if "=" not in stripped or stripped.startswith("#"):
+            out.append(line)
+            continue
+        key, _value = stripped.split("=", 1)
+        k = key.strip()
+        if k in updates:
+            out.append(f"{k}={updates[k]}")
+            seen.add(k)
+        else:
+            out.append(line)
+    for k, v in updates.items():
+        if k not in seen:
+            out.append(f"{k}={v}")
+    env_path.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
 
 
 @dataclass
@@ -368,6 +414,428 @@ def make_health_handler(state: HealthState):
     return HealthHandler
 
 
+class ManagementState:
+    def __init__(
+        self,
+        *,
+        logger: UnifiedLogger,
+        health_state: HealthState,
+        env_path: Path,
+        streamlit_port: int,
+        health_port: int,
+        db_api_url: str,
+    ) -> None:
+        self.logger = logger
+        self.health_state = health_state
+        self.env_path = env_path
+        self.streamlit_port = int(streamlit_port)
+        self.health_port = int(health_port)
+        token = settings.sys_admin_token.strip()
+        self.api_token = token
+        self._lock = threading.Lock()
+        self.store = ComponentStore("management_api")
+        db_api_url = str(self.store.get("db_api_url", db_api_url)).strip() or db_api_url
+        db_api_token = str(self.store.get("db_api_token", settings.db_api_token)).strip() or settings.db_api_token
+        self.db_api = DBApiClient(base_url=db_api_url, token=db_api_token, timeout_s=12)
+        self.store.set("db_api_url", db_api_url)
+        self.store.set("db_api_token", db_api_token)
+
+    def auth_ok(self, authorization: str) -> bool:
+        token = self.api_token.strip()
+        if not token:
+            return True
+        value = (authorization or "").strip()
+        expected = f"Bearer {token}"
+        return value == expected
+
+    def _audit(self, action: str, metadata: dict | None = None) -> None:
+        self.logger.write(
+            "api",
+            "INFO",
+            action,
+            source="management_api",
+            metadata=metadata or {},
+        )
+
+    def get_llm_config(self) -> dict:
+        file_values = _read_env_file(self.env_path)
+        return {
+            "runtime": {
+                "provider": settings.llm_provider,
+                "ollama_url": settings.ollama_url,
+                "ollama_model": settings.ollama_model,
+                "ollama_model_narration": settings.ollama_model_narration,
+                "ollama_model_intent": settings.ollama_model_intent,
+                "ollama_model_review": settings.ollama_model_review,
+                "openai_base_url": settings.openai_base_url,
+                "openai_model": settings.openai_model,
+                "openai_model_narration": settings.openai_model_narration,
+                "openai_model_intent": settings.openai_model_intent,
+                "openai_model_review": settings.openai_model_review,
+                "openai_timeout_s": settings.openai_timeout_s,
+                "ollama_timeout_s": settings.ollama_timeout_s,
+                "ollama_gen_temperature": settings.ollama_gen_temperature,
+                "ollama_json_temperature": settings.ollama_json_temperature,
+                "ollama_gen_num_predict": settings.ollama_gen_num_predict,
+                "ollama_json_num_predict": settings.ollama_json_num_predict,
+                "llm_json_mode_strict": settings.llm_json_mode_strict,
+                "has_openai_api_key": bool(settings.openai_api_key.strip()),
+            },
+            "persisted_env": {
+                "AIGM_LLM_PROVIDER": file_values.get("AIGM_LLM_PROVIDER", ""),
+                "AIGM_OLLAMA_URL": file_values.get("AIGM_OLLAMA_URL", ""),
+                "AIGM_OLLAMA_MODEL": file_values.get("AIGM_OLLAMA_MODEL", ""),
+                "AIGM_OLLAMA_MODEL_NARRATION": file_values.get("AIGM_OLLAMA_MODEL_NARRATION", ""),
+                "AIGM_OLLAMA_MODEL_INTENT": file_values.get("AIGM_OLLAMA_MODEL_INTENT", ""),
+                "AIGM_OLLAMA_MODEL_REVIEW": file_values.get("AIGM_OLLAMA_MODEL_REVIEW", ""),
+                "AIGM_OPENAI_BASE_URL": file_values.get("AIGM_OPENAI_BASE_URL", ""),
+                "AIGM_OPENAI_MODEL": file_values.get("AIGM_OPENAI_MODEL", ""),
+                "AIGM_OPENAI_MODEL_NARRATION": file_values.get("AIGM_OPENAI_MODEL_NARRATION", ""),
+                "AIGM_OPENAI_MODEL_INTENT": file_values.get("AIGM_OPENAI_MODEL_INTENT", ""),
+                "AIGM_OPENAI_MODEL_REVIEW": file_values.get("AIGM_OPENAI_MODEL_REVIEW", ""),
+                "AIGM_OPENAI_TIMEOUT_S": file_values.get("AIGM_OPENAI_TIMEOUT_S", ""),
+                "AIGM_OLLAMA_TIMEOUT_S": file_values.get("AIGM_OLLAMA_TIMEOUT_S", ""),
+                "AIGM_OLLAMA_GEN_TEMPERATURE": file_values.get("AIGM_OLLAMA_GEN_TEMPERATURE", ""),
+                "AIGM_OLLAMA_JSON_TEMPERATURE": file_values.get("AIGM_OLLAMA_JSON_TEMPERATURE", ""),
+                "AIGM_OLLAMA_GEN_NUM_PREDICT": file_values.get("AIGM_OLLAMA_GEN_NUM_PREDICT", ""),
+                "AIGM_OLLAMA_JSON_NUM_PREDICT": file_values.get("AIGM_OLLAMA_JSON_NUM_PREDICT", ""),
+                "AIGM_LLM_JSON_MODE_STRICT": file_values.get("AIGM_LLM_JSON_MODE_STRICT", ""),
+                "AIGM_OPENAI_API_KEY": "***" if file_values.get("AIGM_OPENAI_API_KEY") else "",
+            },
+        }
+
+    def update_llm_config(self, payload: dict) -> dict:
+        map_keys = {
+            "provider": "AIGM_LLM_PROVIDER",
+            "ollama_url": "AIGM_OLLAMA_URL",
+            "ollama_model": "AIGM_OLLAMA_MODEL",
+            "ollama_model_narration": "AIGM_OLLAMA_MODEL_NARRATION",
+            "ollama_model_intent": "AIGM_OLLAMA_MODEL_INTENT",
+            "ollama_model_review": "AIGM_OLLAMA_MODEL_REVIEW",
+            "openai_base_url": "AIGM_OPENAI_BASE_URL",
+            "openai_model": "AIGM_OPENAI_MODEL",
+            "openai_model_narration": "AIGM_OPENAI_MODEL_NARRATION",
+            "openai_model_intent": "AIGM_OPENAI_MODEL_INTENT",
+            "openai_model_review": "AIGM_OPENAI_MODEL_REVIEW",
+            "openai_timeout_s": "AIGM_OPENAI_TIMEOUT_S",
+            "ollama_timeout_s": "AIGM_OLLAMA_TIMEOUT_S",
+            "ollama_gen_temperature": "AIGM_OLLAMA_GEN_TEMPERATURE",
+            "ollama_json_temperature": "AIGM_OLLAMA_JSON_TEMPERATURE",
+            "ollama_gen_num_predict": "AIGM_OLLAMA_GEN_NUM_PREDICT",
+            "ollama_json_num_predict": "AIGM_OLLAMA_JSON_NUM_PREDICT",
+            "llm_json_mode_strict": "AIGM_LLM_JSON_MODE_STRICT",
+            "openai_api_key": "AIGM_OPENAI_API_KEY",
+        }
+        updates: dict[str, str] = {}
+        for src, dst in map_keys.items():
+            if src not in payload:
+                continue
+            val = payload[src]
+            if isinstance(val, bool):
+                updates[dst] = "true" if val else "false"
+            else:
+                updates[dst] = str(val)
+        if updates:
+            with self._lock:
+                _upsert_env_values(self.env_path, updates)
+            self._audit("llm_config_updated", {"keys": sorted(updates.keys())})
+        return {
+            "updated_keys": sorted(updates.keys()),
+            "restart_required": True,
+            "message": "Configuration persisted to .env. Restart services to apply runtime settings.",
+        }
+
+    def get_web_config(self) -> dict:
+        env = _read_env_file(self.env_path)
+        return {
+            "runtime": {
+                "streamlit_port": self.streamlit_port,
+                "healthcheck_port": self.health_port,
+                "healthcheck_url": settings.healthcheck_url,
+                "log_dir": settings.log_dir,
+            },
+            "persisted_env": {
+                "AIGM_STREAMLIT_PORT": env.get("AIGM_STREAMLIT_PORT", ""),
+                "AIGM_HEALTHCHECK_PORT": env.get("AIGM_HEALTHCHECK_PORT", ""),
+                "AIGM_HEALTHCHECK_URL": env.get("AIGM_HEALTHCHECK_URL", ""),
+                "AIGM_LOG_DIR": env.get("AIGM_LOG_DIR", ""),
+            },
+        }
+
+    def update_web_config(self, payload: dict) -> dict:
+        map_keys = {
+            "streamlit_port": "AIGM_STREAMLIT_PORT",
+            "healthcheck_port": "AIGM_HEALTHCHECK_PORT",
+            "healthcheck_url": "AIGM_HEALTHCHECK_URL",
+            "log_dir": "AIGM_LOG_DIR",
+        }
+        updates: dict[str, str] = {}
+        for src, dst in map_keys.items():
+            if src in payload:
+                updates[dst] = str(payload[src])
+        if updates:
+            with self._lock:
+                _upsert_env_values(self.env_path, updates)
+            self._audit("web_config_updated", {"keys": sorted(updates.keys())})
+        return {
+            "updated_keys": sorted(updates.keys()),
+            "restart_required": True,
+            "message": "Configuration persisted to .env. Restart services to apply runtime settings.",
+        }
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        value = token.strip()
+        if len(value) <= 8:
+            return "*" * len(value)
+        return f"{value[:4]}...{value[-4:]}"
+
+    def list_bot_configs(self) -> list[dict]:
+        rows = self.db_api.list_bots(enabled_only=None)
+        return [
+            {
+                "id": int(row.get("id", 0) or 0),
+                "name": str(row.get("name", "") or ""),
+                "is_enabled": bool(row.get("is_enabled", False)),
+                "notes": str(row.get("notes", "") or ""),
+                "token_masked": self._mask_token(str(row.get("discord_token", "") or "")),
+                "updated_at": row.get("updated_at"),
+            }
+            for row in rows
+        ]
+
+    def create_bot_config(self, payload: dict) -> dict:
+        created = self.db_api.create_bot(payload)
+        self._audit("bot_config_created", {"id": created.get("id"), "name": created.get("name")})
+        return {"id": created.get("id"), "name": created.get("name")}
+
+    def update_bot_config(self, bot_id: int, payload: dict) -> dict:
+        updated = self.db_api.update_bot(int(bot_id), payload)
+        self._audit("bot_config_updated", {"id": updated.get("id"), "name": updated.get("name")})
+        return {"id": updated.get("id"), "name": updated.get("name")}
+
+    def delete_bot_config(self, bot_id: int) -> dict:
+        deleted = self.db_api.delete_bot(int(bot_id))
+        self._audit("bot_config_deleted", {"id": deleted.get("id")})
+        return {"id": deleted.get("id"), "deleted": bool(deleted.get("deleted", False))}
+
+    def get_system_logs(self, *, limit: int, service: str, level: str) -> list[dict]:
+        return self.db_api.list_system_logs(limit=limit, service=service, level=level)
+
+    def get_audit_logs(self, *, limit: int) -> list[dict]:
+        return self.db_api.list_audit_logs(limit=limit)
+
+    def check_db(self) -> tuple[bool, str]:
+        try:
+            payload = self.db_api.health()
+            checks = payload.get("checks", {}) or {}
+            db_check = checks.get("db", {})
+            return bool(db_check.get("ok", False)), str(db_check.get("detail", "unknown"))
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    @staticmethod
+    def check_ollama() -> tuple[bool, str]:
+        try:
+            req = request.Request(f"{settings.ollama_url.rstrip('/')}/api/tags", method="GET")
+            with request.urlopen(req, timeout=8) as resp:
+                _ = resp.read()
+            return True, "reachable"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+    @staticmethod
+    def check_openai() -> tuple[bool, str]:
+        if OpenAI is None:
+            return False, "openai package not installed"
+        if not settings.openai_api_key.strip():
+            return False, "AIGM_OPENAI_API_KEY is not configured"
+        try:
+            kwargs: dict = {"api_key": settings.openai_api_key.strip()}
+            if settings.openai_base_url.strip():
+                kwargs["base_url"] = settings.openai_base_url.strip()
+            client = OpenAI(**kwargs)
+            _ = client.models.list()
+            return True, "reachable"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)
+
+
+def make_management_handler(state: ManagementState):
+    class ManagementHandler(BaseHTTPRequestHandler):
+        def _send_json(self, code: int, payload: dict) -> None:
+            body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _read_json(self) -> dict:
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            if length <= 0:
+                return {}
+            raw = self.rfile.read(length).decode("utf-8")
+            if not raw.strip():
+                return {}
+            return json.loads(raw)
+
+        def _require_auth(self) -> bool:
+            auth = self.headers.get("Authorization", "")
+            if state.auth_ok(auth):
+                return True
+            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            return False
+
+        def do_GET(self):  # noqa: N802
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            path = parsed.path
+            query = parse_qs(parsed.query)
+            try:
+                if path == "/api/v1/meta":
+                    self._send_json(
+                        200,
+                        {
+                            "ok": True,
+                            "service": "aigm_management_api",
+                            "timestamp": utc_now_iso(),
+                            "runtime": {
+                                "streamlit_port": state.streamlit_port,
+                                "healthcheck_port": state.health_port,
+                                "has_auth_token": bool(state.api_token),
+                                "db_api_url": state.db_api.base_url,
+                            },
+                            "endpoints": {
+                                "config_llm": "/api/v1/config/llm",
+                                "config_web": "/api/v1/config/web",
+                                "bots": "/api/v1/bots",
+                                "logs_system": "/api/v1/logs/system",
+                                "logs_audit": "/api/v1/logs/audit",
+                                "debug_checks": "/api/v1/debug/checks/*",
+                                "db_api_health": f"{state.db_api.base_url}/db/v1/health",
+                            },
+                        },
+                    )
+                    return
+                if path == "/api/v1/health":
+                    snap = state.health_state.snapshot()
+                    self._send_json(200 if snap.get("ok") else 503, {"ok": bool(snap.get("ok")), "health": snap})
+                    return
+                if path == "/api/v1/config/llm":
+                    self._send_json(200, {"ok": True, "config": state.get_llm_config()})
+                    return
+                if path == "/api/v1/config/web":
+                    self._send_json(200, {"ok": True, "config": state.get_web_config()})
+                    return
+                if path == "/api/v1/bots":
+                    self._send_json(200, {"ok": True, "bots": state.list_bot_configs()})
+                    return
+                if path == "/api/v1/logs/system":
+                    limit = max(1, min(500, int((query.get("limit", ["100"]) or ["100"])[0])))
+                    service = str((query.get("service", [""]) or [""])[0]).strip()
+                    level = str((query.get("level", [""]) or [""])[0]).strip().upper()
+                    rows = state.get_system_logs(limit=limit, service=service, level=level)
+                    self._send_json(200, {"ok": True, "rows": rows})
+                    return
+                if path == "/api/v1/logs/audit":
+                    limit = max(1, min(500, int((query.get("limit", ["100"]) or ["100"])[0])))
+                    rows = state.get_audit_logs(limit=limit)
+                    self._send_json(200, {"ok": True, "rows": rows})
+                    return
+                self._send_json(404, {"ok": False, "error": "not_found"})
+            except Exception as exc:  # noqa: BLE001
+                state.logger.write("api", "ERROR", "GET request failed", source="management_api", metadata={"error": str(exc)})
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_POST(self):  # noqa: N802
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                payload = self._read_json()
+                if path == "/api/v1/bots":
+                    created = state.create_bot_config(payload)
+                    self._send_json(201, {"ok": True, "created": created})
+                    return
+                if path == "/api/v1/debug/checks/db":
+                    ok, detail = state.check_db()
+                    self._send_json(200 if ok else 503, {"ok": ok, "check": "db", "detail": detail})
+                    return
+                if path == "/api/v1/debug/checks/ollama":
+                    ok, detail = state.check_ollama()
+                    self._send_json(200 if ok else 503, {"ok": ok, "check": "ollama", "detail": detail})
+                    return
+                if path == "/api/v1/debug/checks/openai":
+                    ok, detail = state.check_openai()
+                    self._send_json(200 if ok else 503, {"ok": ok, "check": "openai", "detail": detail})
+                    return
+                self._send_json(404, {"ok": False, "error": "not_found"})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                state.logger.write("api", "ERROR", "POST request failed", source="management_api", metadata={"error": str(exc)})
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_PUT(self):  # noqa: N802
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                payload = self._read_json()
+                if path == "/api/v1/config/llm":
+                    result = state.update_llm_config(payload)
+                    self._send_json(200, {"ok": True, **result})
+                    return
+                if path == "/api/v1/config/web":
+                    result = state.update_web_config(payload)
+                    self._send_json(200, {"ok": True, **result})
+                    return
+                if path.startswith("/api/v1/bots/"):
+                    bot_id = int(path.rsplit("/", 1)[-1])
+                    updated = state.update_bot_config(bot_id, payload)
+                    self._send_json(200, {"ok": True, "updated": updated})
+                    return
+                self._send_json(404, {"ok": False, "error": "not_found"})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                state.logger.write("api", "ERROR", "PUT request failed", source="management_api", metadata={"error": str(exc)})
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def do_DELETE(self):  # noqa: N802
+            if not self._require_auth():
+                return
+            parsed = urlparse(self.path)
+            path = parsed.path
+            try:
+                if path.startswith("/api/v1/bots/"):
+                    bot_id = int(path.rsplit("/", 1)[-1])
+                    deleted = state.delete_bot_config(bot_id)
+                    self._send_json(200, {"ok": True, "deleted": deleted})
+                    return
+                self._send_json(404, {"ok": False, "error": "not_found"})
+            except ValueError as exc:
+                self._send_json(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:  # noqa: BLE001
+                state.logger.write(
+                    "api",
+                    "ERROR",
+                    "DELETE request failed",
+                    source="management_api",
+                    metadata={"error": str(exc)},
+                )
+                self._send_json(500, {"ok": False, "error": str(exc)})
+
+        def log_message(self, _format, *args):
+            return
+
+    return ManagementHandler
+
+
 def stream_reader(service: str, stream, out_q: queue.Queue) -> None:
     try:
         for line in iter(stream.readline, ""):
@@ -400,6 +868,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run AI GameMaster supervisor with health API and unified logging.")
     parser.add_argument("--streamlit-port", type=int, default=settings.streamlit_port)
     parser.add_argument("--health-port", type=int, default=settings.healthcheck_port)
+    parser.add_argument("--management-port", type=int, default=settings.management_api_port)
+    parser.add_argument("--db-api-port", type=int, default=settings.db_api_port)
     parser.add_argument("--log-dir", default=settings.log_dir)
     parser.add_argument("--cwd", default=os.getcwd())
     args = parser.parse_args()
@@ -428,6 +898,11 @@ def main() -> int:
             pass
 
     try:
+        db_api_ref = start_process(
+            "db_api",
+            [python_exe, "-m", "aigm.ops.db_api", "--port", str(args.db_api_port)],
+            cwd=args.cwd,
+        )
         bot_manager_ref = start_process(
             "bot_manager",
             [python_exe, "-m", "aigm.ops.bot_manager", "--cwd", args.cwd],
@@ -457,8 +932,15 @@ def main() -> int:
         ollama_url=settings.ollama_url,
         logger=logger,
     )
+    health_state.set_proc("db_api", db_api_ref.popen)
     health_state.set_proc("bot_manager", bot_manager_ref.popen)
     health_state.set_proc("streamlit", streamlit_ref.popen)
+    logger.write(
+        "supervisor",
+        "INFO",
+        "DB API process started.",
+        metadata={"url": f"http://127.0.0.1:{args.db_api_port}/db/v1/health"},
+    )
 
     server = ThreadingHTTPServer(("0.0.0.0", args.health_port), make_health_handler(health_state))
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -470,9 +952,29 @@ def main() -> int:
         metadata={"url": f"http://127.0.0.1:{args.health_port}/health"},
     )
 
+    management_state = ManagementState(
+        logger=logger,
+        health_state=health_state,
+        env_path=Path(args.cwd) / ".env",
+        streamlit_port=args.streamlit_port,
+        health_port=args.health_port,
+        db_api_url=f"http://127.0.0.1:{args.db_api_port}",
+    )
+    management_server = ThreadingHTTPServer(("0.0.0.0", args.management_port), make_management_handler(management_state))
+    management_thread = threading.Thread(target=management_server.serve_forever, daemon=True)
+    management_thread.start()
+    logger.write(
+        "supervisor",
+        "INFO",
+        "Management API started.",
+        metadata={"url": f"http://127.0.0.1:{args.management_port}/api/v1/meta"},
+    )
+
     # Buffered fan-in queue from bot + streamlit stdout/stderr readers.
     q: queue.Queue = queue.Queue()
     threads = [
+        threading.Thread(target=stream_reader, args=("db_api", db_api_ref.popen.stdout, q), daemon=True),
+        threading.Thread(target=stream_reader, args=("db_api", db_api_ref.popen.stderr, q), daemon=True),
         threading.Thread(target=stream_reader, args=("bot_manager", bot_manager_ref.popen.stdout, q), daemon=True),
         threading.Thread(target=stream_reader, args=("bot_manager", bot_manager_ref.popen.stderr, q), daemon=True),
         threading.Thread(target=stream_reader, args=("streamlit", streamlit_ref.popen.stdout, q), daemon=True),
@@ -553,6 +1055,10 @@ def main() -> int:
 
         logger.flush(force=False)
 
+        db_api_exit = db_api_ref.popen.poll()
+        if db_api_exit is not None:
+            logger.write("supervisor", "ERROR", "DB API process exited.", metadata={"exit_code": db_api_exit})
+            stop_flag["value"] = True
         bot_manager_exit = bot_manager_ref.popen.poll()
         if bot_manager_exit is not None:
             logger.write("supervisor", "ERROR", "Bot manager process exited.", metadata={"exit_code": bot_manager_exit})
@@ -568,17 +1074,19 @@ def main() -> int:
             stop_flag["value"] = True
 
     logger.write("supervisor", "INFO", "Supervisor stopping.")
-    for proc in (bot_manager_ref.popen, streamlit_ref.popen):
+    for proc in (db_api_ref.popen, bot_manager_ref.popen, streamlit_ref.popen):
         if proc.poll() is None:
             proc.terminate()
     time.sleep(1)
-    for proc in (bot_manager_ref.popen, streamlit_ref.popen):
+    for proc in (db_api_ref.popen, bot_manager_ref.popen, streamlit_ref.popen):
         if proc.poll() is None:
             proc.kill()
 
     logger.flush(force=True)
     server.shutdown()
     server.server_close()
+    management_server.shutdown()
+    management_server.server_close()
     return 0
 
 

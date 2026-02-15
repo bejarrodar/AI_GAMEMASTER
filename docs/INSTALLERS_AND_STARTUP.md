@@ -13,6 +13,25 @@ Installers are available for:
 - `scripts/install_ubuntu_stack.sh`
 - `scripts/install_debian_stack.sh`
 - `scripts/install_amazon_linux_stack.sh`
+- component installers:
+  - Linux: `scripts/install_bot_stack.sh`, `scripts/install_web_stack.sh`, `scripts/install_llm_stack.sh`, `scripts/install_db_stack.sh`
+  - Windows: `scripts/install_bot_stack.ps1`, `scripts/install_web_stack.ps1`, `scripts/install_llm_stack.ps1`, `scripts/install_db_stack.ps1`
+
+## Installer Modes
+
+- `COMPONENTS=all|bot|web|llm`
+- optional local dependencies:
+  - `INSTALL_LOCAL_POSTGRES=true|false`
+  - `INSTALL_LOCAL_OLLAMA=true|false`
+- bootstrap and service control:
+  - `RUN_DB_BOOTSTRAP=true|false`
+  - `INSTALL_SERVICE=true|false`
+
+This allows:
+- full single-host deployments
+- bot-only hosts using external DB/LLM
+- web-only hosts using external DB/LLM
+- llm-only hosts
 
 ## Local Startup (PowerShell)
 
@@ -22,10 +41,24 @@ Installers are available for:
 
 ## Startup Expectations
 
-- local DB initialized (or bootstrap skipped if already initialized)
-- configured LLM endpoint reachable
+- DB bootstrap/migration validation runs when enabled
+- backend default seed validation runs when Python app components are installed
+- configured LLM endpoint reachable (local or external)
 - health endpoint returns service checks
+- management API endpoint returns component/config/debug surfaces (`/api/v1/meta`)
+- DB API endpoint returns database-backed resources (`/db/v1/health`)
 - logs written to filesystem and DB
+
+## Optional Containerization
+
+Containers are optional and not required.
+
+- compose file: `deploy/docker-compose.optional.yml`
+- profile examples:
+  - `docker compose -f deploy/docker-compose.optional.yml --profile all up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile bot up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile web up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile llm up -d`
 
 ## Backup and Restore
 

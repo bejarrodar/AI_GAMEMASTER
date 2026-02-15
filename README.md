@@ -221,6 +221,11 @@ AIGM_LLM_HTTP_RETRY_BACKOFF_S=0.75
 AIGM_DISCORD_RATE_LIMIT_WINDOW_S=10
 AIGM_DISCORD_RATE_LIMIT_MAX_MESSAGES=6
 AIGM_TURN_CONFLICT_RETRIES=1
+AIGM_MANAGEMENT_API_PORT=9541
+AIGM_DB_API_PORT=9542
+AIGM_DB_API_URL=http://127.0.0.1:9542
+AIGM_DB_API_TOKEN=
+AIGM_COMPONENT_STATE_DIR=./component_state
 AIGM_HEALTH_LOG_INTERVAL_S=30
 AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES=3
 AIGM_HEALTH_ALERT_WEBHOOK_URL=
@@ -287,15 +292,25 @@ The repo now includes dedicated installers for:
 - Debian: `scripts/install_debian_stack.sh`
 - Amazon Linux (RHEL-family): `scripts/install_amazon_linux_stack.sh`
 - Windows: `scripts/install_windows_stack.ps1`
+- Linux component installers:
+  - `scripts/install_bot_stack.sh`
+  - `scripts/install_web_stack.sh`
+  - `scripts/install_llm_stack.sh`
+  - `scripts/install_db_stack.sh`
+- Windows component installers:
+  - `scripts/install_bot_stack.ps1`
+  - `scripts/install_web_stack.ps1`
+  - `scripts/install_llm_stack.ps1`
+  - `scripts/install_db_stack.ps1`
 
 What all installers do by default:
 - install dependencies
-- install local PostgreSQL
-- install Ollama + pull default model
+- install local PostgreSQL (optional)
+- install Ollama + pull default model (optional)
 - create Python venv and install project deps
 - initialize DB schema
 - write `.env` defaults
-- register/start a single supervisor service (bot manager + Streamlit + health API + unified logs)
+- register/start service(s) for selected components
 
 Linux usage:
 
@@ -305,16 +320,61 @@ sudo APP_DIR=/opt/ai-gamemaster APP_USER=debian bash ./scripts/install_debian_st
 sudo APP_DIR=/opt/ai-gamemaster APP_USER=ec2-user bash ./scripts/install_amazon_linux_stack.sh
 ```
 
+Linux component-mode examples:
+
+```bash
+# bot-only host (external DB + external LLM)
+sudo COMPONENTS=bot INSTALL_LOCAL_POSTGRES=false INSTALL_LOCAL_OLLAMA=false bash ./scripts/install_bot_stack.sh
+
+# web-only host (external DB + external LLM)
+sudo COMPONENTS=web INSTALL_LOCAL_POSTGRES=false INSTALL_LOCAL_OLLAMA=false bash ./scripts/install_web_stack.sh
+
+# llm-only host
+sudo bash ./scripts/install_llm_stack.sh
+```
+
 Windows usage (run as Administrator PowerShell):
 
 ```powershell
 .\scripts\install_windows_stack.ps1 -AppDir "D:\AI_GameMaster_code\AI_GAMEMASTER"
 ```
 
+Windows component-mode examples:
+
+```powershell
+# bot-only host
+.\scripts\install_bot_stack.ps1 -AppDir "D:\AI_GameMaster_code\AI_GAMEMASTER" -SkipLocalPostgresInstall -SkipLocalOllamaInstall
+
+# web-only host
+.\scripts\install_web_stack.ps1 -AppDir "D:\AI_GameMaster_code\AI_GAMEMASTER" -SkipLocalPostgresInstall -SkipLocalOllamaInstall
+
+# llm-only host
+.\scripts\install_llm_stack.ps1 -AppDir "D:\AI_GameMaster_code\AI_GAMEMASTER"
+```
+
 Common installer overrides:
 - `APP_DIR`, `APP_USER`, `VENV_DIR`, `OLLAMA_MODEL`
 - `DB_NAME`, `DB_USER`, `DB_PASSWORD`
 - `STREAMLIT_PORT`
+- `COMPONENTS` (`all`, `bot`, `web`, `llm`)
+- `INSTALL_LOCAL_POSTGRES` (`true|false`)
+- `INSTALL_LOCAL_OLLAMA` (`true|false`)
+- `RUN_DB_BOOTSTRAP` (`true|false`)
+- `INSTALL_SERVICE` (`true|false`)
+
+Installer validation (Windows host):
+
+```powershell
+.\scripts\validate_installers.ps1
+```
+
+Optional containerization (not required):
+- `deploy/docker-compose.optional.yml` provides profile-based optional container deployment.
+- Examples:
+  - `docker compose -f deploy/docker-compose.optional.yml --profile all up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile bot up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile web up -d`
+  - `docker compose -f deploy/docker-compose.optional.yml --profile llm up -d`
 
 ## Cross-Platform Launcher + Smoke Checks
 
@@ -414,6 +474,7 @@ Notes:
 - Streamlit port is configurable via `AIGM_STREAMLIT_PORT` (default `9531`).
 - If `AIGM_DISCORD_TOKEN` is set, it validates the token and prints `Logged in as ...` before launching Streamlit.
 - It starts the unified supervisor (Discord bot manager + Streamlit + health API + unified logs).
+- It also starts a versioned management API on `AIGM_MANAGEMENT_API_PORT` (default `9541`).
 - Startup scripts run conditional DB bootstrap so schema creation is skipped when required tables already exist.
 - Supervisor now includes:
   - log file rotation/retention in `AIGM_LOG_DIR`
@@ -488,6 +549,22 @@ The UI supports:
   - save all LLM connection/model/runtime settings back to `.env`
 - Health page for DB/Ollama/Streamlit/process checks via configured `AIGM_HEALTHCHECK_URL`.
   - Supervisor also exposes Prometheus-style metrics at `/metrics`.
+- Management API (auth: `Authorization: Bearer <AIGM_SYS_ADMIN_TOKEN>` when configured):
+  - `GET /api/v1/meta`
+  - `GET /api/v1/health`
+  - `GET|PUT /api/v1/config/llm`
+  - `GET|PUT /api/v1/config/web`
+  - `GET|POST /api/v1/bots`
+  - `PUT|DELETE /api/v1/bots/{id}`
+  - `GET /api/v1/logs/system`, `GET /api/v1/logs/audit`
+  - `POST /api/v1/debug/checks/db|ollama|openai`
+- Dedicated DB API (auth: `Authorization: Bearer <AIGM_DB_API_TOKEN>` when configured):
+  - `GET /db/v1/health`
+  - `GET|POST /db/v1/bots`
+  - `PUT|DELETE /db/v1/bots/{id}`
+  - `GET /db/v1/logs/system`
+  - `GET /db/v1/logs/audit`
+  - `GET /db/v1/debug/table-counts`
 - System Logs page with filters (`service`, `level`, time window, message search) backed by `system_logs`.
 - Bot Manager page for adding/editing/enabling multiple Discord bots using one shared DB (`bot_configs`).
 - Users & Roles page for auth user CRUD, role assignment, Discord linking, role creation, and permission mapping.
@@ -533,7 +610,7 @@ Use this section as the source of truth for quick validation checks after change
 ### Multi-Bot Runtime
 
 - Bot tokens can be configured in Streamlit under **Bot Manager** (table: `bot_configs`).
-- `aigm.ops.bot_manager` launches one process per enabled bot config.
+- `aigm.ops.bot_manager` now fetches enabled bot configs through DB API (`AIGM_DB_API_URL`), not direct DB sessions.
 - If no enabled bot config exists, manager falls back to `AIGM_DISCORD_TOKEN` for backward compatibility.
 - All bots share the same campaign database.
 
@@ -609,8 +686,19 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
 - [ ] Data governance: add PII redaction controls for logs, prompts, and exports.
 - [ ] Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
-- [ ] API/platform: add versioned admin API (health, bots, users/roles, config) for non-UI management.
+- [x] API/platform: add versioned admin API (health, bots, config, logs, debug checks) for non-UI management.
+- [ ] API/platform: add campaign/gameplay DB API endpoints and migrate `GameService` reads/writes behind a service client.
+- [ ] API/platform: migrate Streamlit pages to use only Management/DB APIs (remove direct `SessionLocal` usage in UI layer).
+- [ ] API/platform: split supervisor into independently deployable `web`, `bot`, `management_api`, `db_api` service units with explicit inter-service URLs/tokens.
+- [ ] API/platform: expand management API to full users/roles CRUD + permission scope mapping endpoints.
 - [ ] API/platform: add OpenAPI docs for management endpoints and auth scopes.
+- [ ] API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
+- [ ] API/platform: add inter-service auth scope separation (distinct tokens/scopes per component, token rotation workflow).
+- [ ] API/platform: add API rate limiting and per-endpoint quotas for management/debug surfaces.
+- [ ] API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
+- [ ] API/platform: add service-to-service retry/circuit-breaker policy with consistent error envelope across APIs.
+- [ ] API/platform: add event/audit correlation IDs propagated across API hops (bot -> management -> db_api).
+- [ ] API/platform: add API integration test suite covering cross-component flows (bot config CRUD -> bot manager reconcile -> health/log visibility).
 - [ ] Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
 - [ ] Multi-bot platform: add per-bot config profiles (models, prompts, rate limits, allowed commands, visibility).
 - [ ] Multi-bot platform: add bot lifecycle management (drain mode, maintenance mode, migration between threads).
@@ -655,6 +743,13 @@ Already implemented:
 - Campaign optimistic locking is enabled with `campaigns.version`.
 - Alembic migration scaffolding is included (`alembic.ini`, `alembic/`, `src/aigm/db/migrate.py`) with optional startup usage via `AIGM_DATABASE_USE_ALEMBIC=true`.
 - Health API now exposes Prometheus-style metrics on `/metrics`.
+- Management API is implemented and versioned (`/api/v1/*`) for config, bot management, logs, and debug checks.
+- Dedicated DB API is implemented and versioned (`/db/v1/*`) for DB-backed bot config/log access and DB diagnostics.
+- Bot manager now uses DB API for bot config reads (API call boundary instead of direct DB session).
+- Management API now uses DB API for bot config CRUD/log queries and DB health checks.
+- Component-local configuration store exists for standalone component wiring (`AIGM_COMPONENT_STATE_DIR`).
+- Supervisor now runs DB API as a separate subprocess component and monitors it in health/process checks.
+- DB-only installer entrypoints are available for separated local DB deployments (`scripts/install_db_stack.sh`, `scripts/install_db_stack.ps1`).
 - Supervisor health alerts are configurable (`AIGM_HEALTH_LOG_INTERVAL_S`, `AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES`).
 - Supervisor can send health alerts to webhook endpoints (`AIGM_HEALTH_ALERT_WEBHOOK_URL`, `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S`).
 - Turn success/failure counters and latency sums are exported on `/metrics` (plus log queue depth gauge).
