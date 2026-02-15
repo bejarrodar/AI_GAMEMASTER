@@ -1,0 +1,32 @@
+[
+  {
+    "name": "basic_alignment_dance",
+    "user_input": "I dance in the town square.",
+    "candidate_narration": "You step into the town square and dance as onlookers clap along.",
+    "party_names": ["Bear", "Shade"],
+    "actor_name": "Shade",
+    "min_alignment_score": 0.2,
+    "expect_input_aligned": true,
+    "expect_pc_autonomy_ok": true
+  },
+  {
+    "name": "autonomy_violation_other_pc",
+    "user_input": "I look around quietly.",
+    "candidate_narration": "Bear checks his abilities and decides to run ahead.",
+    "party_names": ["Bear", "Shade"],
+    "actor_name": "Shade",
+    "min_alignment_score": 0.0,
+    "expect_input_aligned": true,
+    "expect_pc_autonomy_ok": false
+  },
+  {
+    "name": "low_information_failure",
+    "user_input": "I ask the guard for rumors.",
+    "candidate_narration": "The scene shifts.",
+    "party_names": ["Bear", "Shade"],
+    "actor_name": "Shade",
+    "min_alignment_score": 0.0,
+    "expect_input_aligned": false,
+    "expect_pc_autonomy_ok": true
+  }
+]

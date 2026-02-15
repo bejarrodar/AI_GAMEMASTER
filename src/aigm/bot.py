@@ -33,6 +33,7 @@ async def on_message(message: discord.Message) -> None:
         return
 
     with SessionLocal() as db:
+        service.seed_default_gameplay_knowledge(db)
         campaign = service.get_or_create_campaign(db, thread_id=str(message.channel.id), mode="dnd")
         player = service.ensure_player(db, campaign, str(message.author.id), message.author.display_name)
         actor_id = str(message.author.id)
@@ -168,9 +169,73 @@ async def on_message(message: discord.Message) -> None:
 
         if message.content.startswith("!rules"):
             custom = service.list_rules(db, campaign)
-            effective = merge_rules(custom)
+            effective = merge_rules(custom, mode=campaign.mode)
             rendered = "\n".join(f"- {k}: {v}" for k, v in effective.items())
             await message.channel.send(f"Effective rules:\n{rendered}")
+            return
+
+        if message.content.startswith("!showruleset"):
+            active = service.get_campaign_ruleset(db, campaign)
+            if not active:
+                await message.channel.send("No active ruleset configured.")
+                return
+            await message.channel.send(
+                f"Active ruleset: **{active.key}** ({active.name})\nSystem: {active.system} {active.version}\n{active.summary}"
+            )
+            return
+
+        if message.content.startswith("!setruleset "):
+            key = message.content.removeprefix("!setruleset ").strip()
+            ok, detail = service.set_campaign_ruleset(db, campaign, key)
+            await message.channel.send(f"Ruleset set to **{detail}**." if ok else f"Failed: {detail}")
+            return
+
+        if message.content.startswith("!rulelookup "):
+            query = message.content.removeprefix("!rulelookup ").strip()
+            if not query:
+                await message.channel.send("Usage: !rulelookup <query>")
+                return
+            rows = service.rule_lookup_for_campaign(db, campaign, query, limit=3)
+            if not rows:
+                await message.channel.send("No matching rulebook entries found.")
+                return
+            lines: list[str] = []
+            for r in rows:
+                content = str(r.get("content", "")).strip()
+                if len(content) > 240:
+                    content = content[:237].rstrip() + "..."
+                lines.append(
+                    f"- **{r.get('title', '')}** ({r.get('rulebook', '')} {r.get('page_ref', '')})\n"
+                    f"  {content}"
+                )
+            await message.channel.send("\n".join(lines)[:1900])
+            return
+
+        if message.content.startswith("!roll "):
+            expr = message.content.removeprefix("!roll ").strip()
+            ok, roll = service.roll_dice(expr)
+            if not ok:
+                await message.channel.send(str(roll.get("error", "Invalid roll.")))
+                return
+            service.log_dice_roll(
+                db,
+                campaign=campaign,
+                actor_discord_user_id=actor_id,
+                actor_display_name=message.author.display_name,
+                roll_data=roll,
+            )
+            adv_mode = str(roll.get("advantage_mode", "none"))
+            if adv_mode != "none":
+                msg = (
+                    f"`{roll['normalized_expression']}` -> rolls {roll['rolls']} "
+                    f"({adv_mode}), picked **{roll['picked']}**, total **{roll['total']}**"
+                )
+            else:
+                msg = (
+                    f"`{roll['normalized_expression']}` -> rolls {roll['rolls']} "
+                    f"+ {roll['modifier']} = **{roll['total']}**"
+                )
+            await message.channel.send(msg)
             return
 
         if message.content.startswith("!mycharacter "):

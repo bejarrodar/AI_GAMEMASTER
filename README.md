@@ -17,10 +17,25 @@ AI Game Master backend for Discord thread-based games, with **strict state valid
 
 1. **Discord adapter** (`src/aigm/bot.py`)
    - Receives player messages in a thread.
-   - Loads/creates campaign state by thread ID.
+   - Creates a campaign per thread on first message.
    - Supports runtime thread commands:
+     - `!adminauth <token>`
+     - `!adminlogout`
+     - `!adminrules`
+     - `!adminrule add|update|remove ...`
      - `!setrule key=value`
+     - `!agencyprofiles`
+     - `!setagencyprofile <profile>`
+     - `!agencyrules`
+     - `!setagencyrules <csv_rule_ids>`
+     - `!setcharacter <character instructions>`
+     - `!setprompt <custom campaign directives>`
+     - `!showprompt`
      - `!rules`
+     - `!showruleset`
+     - `!setruleset <ruleset_key>`
+     - `!rulelookup <query>`
+     - `!roll <dice_expression>`
      - `!mycharacter <natural language description>`
      - `!additem <character_name> <item_key> <quantity>`
      - `!addeffect <character>|<magical|physical|misc>|<effect_key>|<duration_or_none>|<description>`
@@ -51,6 +66,8 @@ AI Game Master backend for Discord thread-based games, with **strict state valid
    - `inventory_items`: normalized inventory per player.
    - `campaign_rules`: custom rule overrides by thread.
    - `feedback`: quality feedback for model tuning.
+   - `admin_audit_logs`: append-only audit trail for admin operations.
+   - Global learned relevance + knowledge for items/effects across all campaigns.
 
 ## State model details
 
@@ -58,6 +75,12 @@ Each character now includes:
 - **Inventory quantities** (`inventory`)
 - **Per-item state** (`item_states`) for cases like `ignited=true`
 - **Timed effects** (`effects`) categorized as `magical`, `physical`, or `misc`
+
+World-level state now also includes:
+
+- **NPC entities** (`npcs`) with disposition/location/flags
+- **Location graph nodes** (`locations`) with tags/links
+- **Combat round marker** (`combat_round`) for tactical turn tracking
 
 Example: a sword can track `item_states["flame_sword"]["ignited"] = true`, and a character can carry a physical effect like `broken_arm` with a duration.
 
@@ -78,9 +101,13 @@ Set these in Discord:
 - `!setprompt ...`
 - `!agencyprofiles` / `!setagencyprofile ...`
 - `!agencyrules` / `!setagencyrules ...`
+- `!agentmode [classic|crew]` to select per-campaign turn engine
 - `!showprompt` to inspect the effective prompt
 - `!adminauth <token>` for sys_admin authentication
 - `!adminrules` / `!adminrule add|update|remove ...` for system rule CRUD
+
+Story mode note:
+- Campaigns started with `!startstory` (or `!startgame story`) default to the `minimal` agency profile unless explicitly overridden by campaign rules.
 
 Internally this is implemented in `src/aigm/core/prompts.py` and wired via `GameService.build_campaign_system_prompt`.
 
@@ -109,6 +136,44 @@ The DB layer includes TLS settings for proxied/secured Postgres links:
 - `AIGM_DATABASE_SSLMODE` (default: `require`)
 - `AIGM_DATABASE_CONNECT_TIMEOUT_S` (default: `10`)
 
+## Authentication / RBAC
+
+The app now includes a database-backed authentication system with:
+- users (username/password, optional linked Discord user id)
+- roles
+- permissions
+- role-permission and user-role mappings
+
+Default permissions include:
+- `campaign.read`
+- `campaign.play`
+- `campaign.retry`
+- `campaign.write`
+- `campaign.import`
+- `campaign.export`
+- `rules.manage`
+- `system.admin`
+- `user.manage`
+
+Default roles include:
+- `viewer`
+- `player`
+- `gm`
+- `admin`
+
+Enable permission enforcement:
+- `AIGM_AUTH_ENFORCE=true`
+
+Optional bootstrap admin on startup:
+- `AIGM_AUTH_BOOTSTRAP_ADMIN_USERNAME=<username>`
+- `AIGM_AUTH_BOOTSTRAP_ADMIN_PASSWORD=<password>`
+
+When enforcement is enabled:
+- Discord command access is checked per permission (with `sys_admin` fallback).
+- Discord admin commands can be authorized either by legacy `!adminauth` token flow or by linking a Discord user to an auth user with `system.admin`.
+- Streamlit requires login and gates operations by permission.
+- Admin tab includes auth user creation, Discord-linking, role assignment, and password reset tools.
+
 This allows secure connections when Postgres sits behind a Cloudflare/Cloudflared path.
 
 ## Quickstart
@@ -130,8 +195,64 @@ AIGM_DISCORD_TOKEN=your_discord_bot_token
 AIGM_DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/aigm
 AIGM_DATABASE_SSLMODE=require
 AIGM_DATABASE_CONNECT_TIMEOUT_S=10
+AIGM_DATABASE_AUTO_INIT=true
+AIGM_DATABASE_USE_ALEMBIC=false
 AIGM_SYS_ADMIN_TOKEN=change_this_admin_secret
+AIGM_AUTH_ENFORCE=false
+AIGM_AUTH_BOOTSTRAP_ADMIN_USERNAME=
+AIGM_AUTH_BOOTSTRAP_ADMIN_PASSWORD=
+AIGM_LLM_PROVIDER=ollama
+AIGM_OLLAMA_URL=http://localhost:11434
+AIGM_OLLAMA_MODEL=qwen2.5:7b-instruct
+AIGM_OLLAMA_MODEL_NARRATION=
+AIGM_OLLAMA_MODEL_INTENT=
+AIGM_OLLAMA_MODEL_REVIEW=
+AIGM_OLLAMA_TIMEOUT_S=180
+AIGM_OPENAI_API_KEY=
+AIGM_OPENAI_BASE_URL=
+AIGM_OPENAI_MODEL=gpt-4o-mini
+AIGM_OPENAI_MODEL_NARRATION=
+AIGM_OPENAI_MODEL_INTENT=
+AIGM_OPENAI_MODEL_REVIEW=
+AIGM_OPENAI_TIMEOUT_S=90
+AIGM_LLM_JSON_MODE_STRICT=true
+AIGM_LLM_HTTP_MAX_RETRIES=2
+AIGM_LLM_HTTP_RETRY_BACKOFF_S=0.75
+AIGM_DISCORD_RATE_LIMIT_WINDOW_S=10
+AIGM_DISCORD_RATE_LIMIT_MAX_MESSAGES=6
+AIGM_TURN_CONFLICT_RETRIES=1
+AIGM_HEALTH_LOG_INTERVAL_S=30
+AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES=3
+AIGM_HEALTH_ALERT_WEBHOOK_URL=
+AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S=300
+AIGM_BACKUP_ENCRYPTION_PASSPHRASE=
+AIGM_SECRET_SOURCE=none
+AIGM_SECRET_SOURCE_JSON_FILE=
+AIGM_SECRET_SOURCE_COMMAND=
+AIGM_SECRET_SOURCE_AWS_SECRET_ID=
+AIGM_SECRET_SOURCE_AWS_REGION=
+AIGM_SECRET_ROTATION_MAX_AGE_DAYS=30
 ```
+
+LLM provider notes:
+- `AIGM_LLM_PROVIDER=ollama` uses the local Ollama backend.
+- `AIGM_LLM_PROVIDER=openai` uses OpenAI-compatible chat-completions APIs.
+- If `AIGM_OPENAI_BASE_URL` is set, the OpenAI client points to that compatible endpoint.
+- `AIGM_LLM_JSON_MODE_STRICT=true` enforces strict JSON response formatting where supported.
+- `AIGM_DATABASE_USE_ALEMBIC=true` runs Alembic migrations from startup bootstrap paths.
+- `AIGM_DATABASE_AUTO_INIT=false` disables implicit schema creation fallback.
+- `*_FILE` secret vars are supported for secure injection in production:
+  - `AIGM_DISCORD_TOKEN_FILE`
+  - `AIGM_OPENAI_API_KEY_FILE`
+  - `AIGM_SYS_ADMIN_TOKEN_FILE`
+  - `AIGM_DATABASE_URL_FILE`
+- Backup encryption passphrase can also be provided securely:
+  - `AIGM_BACKUP_ENCRYPTION_PASSPHRASE`
+  - `AIGM_BACKUP_ENCRYPTION_PASSPHRASE_FILE`
+- External secret source loaders are supported:
+  - `AIGM_SECRET_SOURCE=json_file` + `AIGM_SECRET_SOURCE_JSON_FILE`
+  - `AIGM_SECRET_SOURCE=command` + `AIGM_SECRET_SOURCE_COMMAND`
+  - `AIGM_SECRET_SOURCE=aws_secrets_manager` + `AIGM_SECRET_SOURCE_AWS_SECRET_ID` (+ optional region)
 
 ### 3) Init DB
 
@@ -139,6 +260,12 @@ Option A: Python metadata create-all
 
 ```bash
 python -m aigm.db.init_db
+```
+
+Conditional bootstrap (preferred for startup scripts; only runs when required tables are missing):
+
+```bash
+python -m aigm.db.bootstrap --required-table campaigns --required-table system_logs --required-table bot_configs
 ```
 
 Option B: run SQL migration manually
@@ -153,13 +280,411 @@ psql "$AIGM_DATABASE_URL" -f sql/001_init.sql
 python -m aigm.bot
 ```
 
-## Extending this to production
+## Cloud / OS Installers
 
-- Replace `LLMAdapter` stub (`src/aigm/adapters/llm.py`) with your provider and JSON schema/tool-calling.
-- Add optimistic locking/version columns for concurrent thread writes.
-- Move from `create_all` to Alembic migrations.
-- Add richer world model (NPC entities, locations, combat rounds).
-- Add per-mode rule packs (e.g., strict DnD, loose story mode).
+The repo now includes dedicated installers for:
+- Ubuntu: `scripts/install_ubuntu_stack.sh`
+- Debian: `scripts/install_debian_stack.sh`
+- Amazon Linux (RHEL-family): `scripts/install_amazon_linux_stack.sh`
+- Windows: `scripts/install_windows_stack.ps1`
+
+What all installers do by default:
+- install dependencies
+- install local PostgreSQL
+- install Ollama + pull default model
+- create Python venv and install project deps
+- initialize DB schema
+- write `.env` defaults
+- register/start a single supervisor service (bot manager + Streamlit + health API + unified logs)
+
+Linux usage:
+
+```bash
+sudo APP_DIR=/opt/ai-gamemaster APP_USER=ubuntu bash ./scripts/install_ubuntu_stack.sh
+sudo APP_DIR=/opt/ai-gamemaster APP_USER=debian bash ./scripts/install_debian_stack.sh
+sudo APP_DIR=/opt/ai-gamemaster APP_USER=ec2-user bash ./scripts/install_amazon_linux_stack.sh
+```
+
+Windows usage (run as Administrator PowerShell):
+
+```powershell
+.\scripts\install_windows_stack.ps1 -AppDir "D:\AI_GameMaster_code\AI_GAMEMASTER"
+```
+
+Common installer overrides:
+- `APP_DIR`, `APP_USER`, `VENV_DIR`, `OLLAMA_MODEL`
+- `DB_NAME`, `DB_USER`, `DB_PASSWORD`
+- `STREAMLIT_PORT`
+
+## Cross-Platform Launcher + Smoke Checks
+
+Use this matrix after install so deployment validation is consistent across environments.
+
+| OS | Start/Restart Services | Service Status | Unified Logs |
+|---|---|---|---|
+| Ubuntu / Debian / Amazon Linux | `sudo systemctl restart aigm-supervisor` | `sudo systemctl status aigm-supervisor --no-pager` | `sudo journalctl -u aigm-supervisor -n 100 --no-pager` plus files in `AIGM_LOG_DIR` |
+| Windows | `sc.exe start aigm-supervisor` | `sc.exe query aigm-supervisor` | Event Viewer plus files in `AIGM_LOG_DIR` |
+
+### Smoke Checks (All Platforms)
+
+1. Health check (supervisor API)
+   - Linux/macOS:
+     ```bash
+     curl -s http://127.0.0.1:9540/health
+     ```
+   - Windows PowerShell:
+     ```powershell
+     Invoke-RestMethod -Method Get -Uri http://127.0.0.1:9540/health
+     ```
+
+2. Streamlit reachable
+   - Linux/macOS:
+     ```bash
+     curl -I http://127.0.0.1:9531
+     ```
+   - Windows PowerShell:
+     ```powershell
+     Invoke-WebRequest -Method Head -Uri http://127.0.0.1:9531
+     ```
+
+3. DB ping
+   - Linux:
+     ```bash
+     psql "postgresql://aigm:aigm_password_change_me@localhost:5432/aigm" -c "SELECT 1;"
+     ```
+   - Windows (if `psql` in PATH):
+     ```powershell
+     psql "postgresql://aigm:aigm_password_change_me@localhost:5432/aigm" -c "SELECT 1;"
+     ```
+
+4. Ollama ping
+   - Linux/macOS:
+     ```bash
+     curl -s http://127.0.0.1:11434/api/tags
+     ```
+   - Windows PowerShell:
+     ```powershell
+     Invoke-RestMethod -Method Get -Uri http://127.0.0.1:11434/api/tags
+     ```
+
+5. App-level Python ping (DB + settings loaded)
+   - All platforms:
+     ```bash
+     .venv/bin/python -m aigm.db.init_db
+     ```
+     Windows PowerShell:
+     ```powershell
+     .\.venv\Scripts\python.exe -m aigm.db.init_db
+     ```
+
+### Optional Quick Verification Checklist
+
+- `aigm-supervisor` service is `active/running`.
+- Streamlit UI opens and campaign list loads.
+- `GET /health` returns checks for DB, Ollama, Streamlit, and child processes.
+- `SELECT 1` succeeds against configured DB.
+- `GET /api/tags` succeeds against configured Ollama endpoint.
+- Discord bot appears online and responds to `!gmhelp` in a thread.
+
+## Local testing environment (PowerShell)
+
+Set up once:
+
+```powershell
+.\scripts\setup_local_test_env.ps1
+```
+
+Run lint + tests:
+
+```powershell
+.\scripts\run_tests.ps1
+```
+
+Run the full local stack (DB + Ollama + model + DB init + tests + Streamlit + bot manager):
+
+```powershell
+.\scripts\start_local_stack.ps1
+```
+
+Notes:
+- This script uses a local SQLite database file (default: `.\aigm_local.db`) so Docker/virtualization is not required.
+- It checks for `ollama`, installs it with `winget` if missing, then pulls `qwen2.5:7b-instruct` by default.
+- For better story quality, you can set `AIGM_OLLAMA_MODEL_NARRATION` to a stronger model (example: `qwen2.5:14b-instruct`) while keeping `AIGM_OLLAMA_MODEL_INTENT` and `AIGM_OLLAMA_MODEL_REVIEW` on a smaller model.
+- It writes/updates local `.env` keys for DB + Ollama settings.
+- Streamlit port is configurable via `AIGM_STREAMLIT_PORT` (default `9531`).
+- If `AIGM_DISCORD_TOKEN` is set, it validates the token and prints `Logged in as ...` before launching Streamlit.
+- It starts the unified supervisor (Discord bot manager + Streamlit + health API + unified logs).
+- Startup scripts run conditional DB bootstrap so schema creation is skipped when required tables already exist.
+- Supervisor now includes:
+  - log file rotation/retention in `AIGM_LOG_DIR`
+  - batched DB writes into `system_logs` to reduce overhead under heavy output
+- Streamlit is started in headless mode from this script, so it does not auto-open a browser window.
+
+Start only the Streamlit UI with forced local env (safe for manual reruns):
+
+```powershell
+.\scripts\start_streamlit_local.ps1
+```
+
+Start only the Discord bot manager with forced local env:
+
+```powershell
+.\scripts\start_discord_bot_local.ps1
+```
+
+Backup/restore database quickly:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\backup_db.py
+.\.venv\Scripts\python.exe .\scripts\restore_db.py .\backups\your_backup_file.db --force
+```
+
+Encrypted backup/restore:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\backup_db.py --encrypt
+.\.venv\Scripts\python.exe .\scripts\restore_db.py .\backups\your_backup_file.db.enc --encrypted --force
+```
+
+Run a local backup/restore drill (sqlite):
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\backup_restore_drill.py --passphrase "<your-passphrase>"
+```
+
+Rotate local secrets in `.env`:
+
+```powershell
+.\.venv\Scripts\python.exe .\scripts\rotate_local_secrets.py --rotate-admin-token --rotate-backup-passphrase
+```
+
+## Streamlit management UI
+
+Install UI extras:
+
+```bash
+pip install -e .[ui]
+```
+
+Run:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The UI supports:
+- Campaign state inspection.
+- Campaign rule override CRUD (same keys as `!setrule`).
+- System agency rule block management.
+- Per-campaign turn engine selection (`turn_engine`: `classic` or `crew`).
+- Crew-style agent definition editing via `agent_crew_definition` JSON rule.
+- Crew dry-run/apply actions using the same validation + state machine safety checks.
+- LLM Management page:
+  - switch provider (`ollama`, `openai`, `stub`)
+  - configure task models (narration/intent/review)
+  - manage JSON mode strictness
+  - list/pull/delete Ollama models
+  - list OpenAI-compatible models
+  - save all LLM connection/model/runtime settings back to `.env`
+- Health page for DB/Ollama/Streamlit/process checks via configured `AIGM_HEALTHCHECK_URL`.
+  - Supervisor also exposes Prometheus-style metrics at `/metrics`.
+- System Logs page with filters (`service`, `level`, time window, message search) backed by `system_logs`.
+- Bot Manager page for adding/editing/enabling multiple Discord bots using one shared DB (`bot_configs`).
+- Users & Roles page for auth user CRUD, role assignment, Discord linking, role creation, and permission mapping.
+- Documentation page that renders section files from `docs/*.md`.
+- Gameplay & Knowledge page:
+  - assign campaign ruleset
+  - upsert/list rulesets
+  - upsert/list rulebooks and entries
+  - run rulebook lookup queries
+  - test dice expressions and inspect dice roll logs
+- Admin connection management:
+  - test/save DB URL
+  - persist DB settings to `.env` from UI
+- restart notice for applying changes
+
+## Validation Reference
+
+Use this section as the source of truth for quick validation checks after changes/deployments.
+
+- Discord command handlers implemented in `src/aigm/bot.py`:
+  - `!adminauth`, `!adminlogout`
+  - `!adminrules`, `!adminrule add|update|remove`
+  - `!setrule`, `!rules`
+  - `!agencyprofiles`, `!setagencyprofile`, `!agencyrules`, `!setagencyrules`
+  - `!setcharacter`, `!setprompt`, `!showprompt`
+  - `!showruleset`, `!setruleset`, `!rulelookup`, `!roll`
+  - `!mycharacter`, `!additem`, `!addeffect`
+- Streamlit pages implemented in `streamlit_app.py`:
+  - `Campaign Console`
+  - `Health`
+  - `LLM Management`
+  - `Gameplay & Knowledge`
+  - `Item Tracker`
+  - `System Logs`
+  - `Bot Manager`
+  - `Users & Roles`
+  - `Admin`
+  - `Documentation`
+- Schema/bootstrap maintenance:
+  - `python -m aigm.db.bootstrap` validates required tables and applies init/migration path.
+  - Startup scripts run bootstrap + backend seed validation on launch.
+
+### Multi-Bot Runtime
+
+- Bot tokens can be configured in Streamlit under **Bot Manager** (table: `bot_configs`).
+- `aigm.ops.bot_manager` launches one process per enabled bot config.
+- If no enabled bot config exists, manager falls back to `AIGM_DISCORD_TOKEN` for backward compatibility.
+- All bots share the same campaign database.
+
+### Logging Tunables
+
+- `AIGM_LOG_DIR`: filesystem log output directory
+- `AIGM_LOG_FILE_MAX_BYTES`: rotate active log once this size is reached
+- `AIGM_LOG_FILE_BACKUP_COUNT`: number of rotated backups retained per log
+- `AIGM_LOG_DB_BATCH_SIZE`: batch size for DB writes into `system_logs`
+- `AIGM_LOG_DB_FLUSH_INTERVAL_S`: max flush interval for pending DB log rows
+
+## Documentation
+
+The Streamlit **Documentation** page is organized into these sections:
+
+- `LLM Setup`
+- `Streamlit Management UI`
+- `Bot Management`
+- `Discord Commands`
+- `Gameplay and Knowledge`
+- `Auth and Roles`
+- `Health and Logs`
+- `World Model`
+- `Long Horizon Memory`
+- `Model Eval`
+- `HA DR Runbook`
+- `Deployment Hardening`
+- `Installers and Startup`
+- `Full README`
+
+Each Documentation section is backed by its own markdown file:
+
+- `docs/LLM_SETUP.md`
+- `docs/STREAMLIT_MANAGEMENT_UI.md`
+- `docs/BOT_MANAGEMENT.md`
+- `docs/DISCORD_COMMANDS.md`
+- `docs/GAMEPLAY_KNOWLEDGE.md`
+- `docs/AUTH_AND_ROLES.md`
+- `docs/HEALTH_AND_LOGS.md`
+- `docs/WORLD_MODEL.md`
+- `docs/LONG_HORIZON_MEMORY.md`
+- `docs/MODEL_EVAL.md`
+- `docs/HA_DR_RUNBOOK.md`
+- `docs/DEPLOYMENT_HARDENING.md`
+- `docs/INSTALLERS_AND_STARTUP.md`
+- `docs/FULL_README.md`
+
+## Current and Future Enhancements / Requirements
+
+Use this as the active backlog of enhancements and requirements. Remove items from this list as they are implemented.
+
+- [ ] Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
+- [ ] Reliability: define formal SLOs/SLIs (turn latency, success rate, health uptime) with alert routing and on-call escalation docs.
+- [ ] Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
+- [ ] Reliability: add circuit breakers around LLM provider failures and queue overload with graceful degradation modes.
+- [ ] Reliability: add idempotent message processing keys to prevent duplicate turn application on retries/reconnects.
+- [ ] Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
+- [ ] Reliability: implement async worker queue for turn processing to isolate Discord event loop from heavy inference paths.
+- [ ] Discord command surface: restore explicit pre-start game lifecycle commands (`!startgame`, `!startstory`) with thread gating.
+- [ ] Discord command surface: restore `!gmhelp` command discovery/help output.
+- [ ] Discord command surface: restore `!ping` health command.
+- [ ] Discord command surface: restore campaign snapshot commands (`!exportcampaign`, `!importcampaign`, `!adminrestorecampaign`).
+- [ ] Discord command surface: restore turn retry command (`!retry`) with state rollback guarantees.
+- [ ] Discord command surface: restore command aliases (`!mycharactor`, `!deletecharacter`, `!deletecharactor`) and `!teach`.
+- [ ] Discord command surface: restore per-campaign engine command (`!agentmode [classic|crew]`).
+- [ ] Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
+- [ ] Observability: add distributed correlation IDs across Discord message -> turn -> LLM calls -> DB writes.
+- [ ] Observability: add structured JSON logging baseline and log schemas for all services/scripts.
+- [ ] Observability: add alert rules for stalled turns, repeated fallback usage, and token/latency anomalies.
+- [ ] Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
+- [ ] Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
+- [ ] Security: add rate limits and abuse controls for admin endpoints and dangerous commands.
+- [ ] Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
+- [ ] Data governance: add PII redaction controls for logs, prompts, and exports.
+- [ ] Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
+- [ ] API/platform: add versioned admin API (health, bots, users/roles, config) for non-UI management.
+- [ ] API/platform: add OpenAPI docs for management endpoints and auth scopes.
+- [ ] Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
+- [ ] Multi-bot platform: add per-bot config profiles (models, prompts, rate limits, allowed commands, visibility).
+- [ ] Multi-bot platform: add bot lifecycle management (drain mode, maintenance mode, migration between threads).
+- [ ] State safety: complete command-level transactional guarantees so all mutations are atomic per turn.
+- [ ] State safety: add full rewind/replay tooling (per-turn rollback, selective replay, conflict handling).
+- [ ] State safety: add schema validation for all persisted `ai_raw_output` payloads with migration/versioning.
+- [ ] LLM robustness: add response contract tests for intent extraction/review/generation JSON modes across providers.
+- [ ] LLM robustness: add adaptive fallback routing across local and external LLM providers by latency/quality targets.
+- [ ] LLM robustness: add prompt template versioning with A/B testing and rollback.
+- [ ] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
+- [ ] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
+- [ ] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
+- [ ] Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
+- [ ] Gameplay systems: expand configurable ruleset packs beyond current baseline (additional systems/editions, deeper mechanics metadata, compatibility layers).
+- [ ] Gameplay systems: add initiative/order/combat toolkit and encounter state tracking.
+- [ ] Gameplay systems: add economy subsystem (currency validation, pricing tables, purchase checks).
+- [ ] Knowledge systems: expand rulebook ingestion pipeline with stronger provenance/citation enforcement and bulk import tooling.
+- [ ] Knowledge systems: expand retrieval/ranking with confidence scoring and citation quality controls.
+- [ ] Knowledge systems: add approval workflow + provenance history for custom lore/books authoring.
+- [ ] Knowledge systems: add world encyclopedia entities (items, factions, locations, spells, effects) with admin curation.
+- [ ] GM profiles: add selectable GM styles (genre + personality presets) and per-campaign style overrides.
+- [ ] GM profiles: add safety/style guardrails per profile (tone bounds, violence bounds, forbidden content).
+- [ ] UX/theming: add theme manager (icons, palettes, typography, layout presets) with user-level preferences.
+- [ ] UX/theming: add campaign presentation skins (fantasy/sci-fi/horror) and visual assets mapping.
+- [ ] UX/theming: add accessibility pass (contrast, keyboard nav, reduced motion, screen-reader labels).
+- [ ] Collaboration: add concurrent speaker handling policy (message ordering windows, simultaneous action resolution).
+- [ ] Collaboration: add GM moderation tools (pause/resume thread, soft-delete turn, annotate rulings).
+- [ ] Import/export: add granular export/import scopes (characters, rules, inventory, world, logs, memories, bots).
+- [ ] Import/export: add signed/verified backup bundles for secure transfer between threads/servers.
+- [ ] Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
+- [ ] Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
+- [ ] Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
+- [ ] Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
+- [ ] Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
+
+Already implemented:
+
+- Discord turn processing runs heavy turn work in worker threads via `asyncio.to_thread`.
+- LLM HTTP calls now have configurable retry/backoff (`AIGM_LLM_HTTP_MAX_RETRIES`, `AIGM_LLM_HTTP_RETRY_BACKOFF_S`).
+- Discord per-user/thread rate limiting is enforced (`AIGM_DISCORD_RATE_LIMIT_WINDOW_S`, `AIGM_DISCORD_RATE_LIMIT_MAX_MESSAGES`).
+- CI includes dependency vulnerability auditing via `pip-audit`.
+- Campaign optimistic locking is enabled with `campaigns.version`.
+- Alembic migration scaffolding is included (`alembic.ini`, `alembic/`, `src/aigm/db/migrate.py`) with optional startup usage via `AIGM_DATABASE_USE_ALEMBIC=true`.
+- Health API now exposes Prometheus-style metrics on `/metrics`.
+- Supervisor health alerts are configurable (`AIGM_HEALTH_LOG_INTERVAL_S`, `AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES`).
+- Supervisor can send health alerts to webhook endpoints (`AIGM_HEALTH_ALERT_WEBHOOK_URL`, `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S`).
+- Turn success/failure counters and latency sums are exported on `/metrics` (plus log queue depth gauge).
+- Turn conflict retries are configurable (`AIGM_TURN_CONFLICT_RETRIES`).
+- Secret file loading is supported for key credentials (`*_FILE` variables).
+- External secret sources are supported (`json_file`, `command`, `aws_secrets_manager`).
+- Secret governance checks include rotation-age health validation (`AIGM_SECRET_ROTATION_MAX_AGE_DAYS`).
+- Secret source access and local secret rotation events are auditable in `admin_audit_logs`.
+- Admin actions are audited to `admin_audit_logs` (Discord and Streamlit management flows).
+- A lightweight load/perf harness is available at `scripts/load_test_turns.py`.
+- Long-horizon narrative memory/archival summarization is implemented via `campaign_memory_summaries`.
+- DB backup/restore helper scripts are available (`scripts/backup_db.py`, `scripts/restore_db.py`).
+- Encrypted backup/restore is supported via passphrase (`scripts/backup_db.py --encrypt`, `scripts/restore_db.py --encrypted`).
+- Local backup/restore drill script is available (`scripts/backup_restore_drill.py`).
+- High-availability and DR guidance is documented (`docs/HA_DR_RUNBOOK.md`).
+- Local secret rotation helper is available (`scripts/rotate_local_secrets.py`).
+- World model includes NPCs, locations, and combat round support (`WorldState` extensions).
+- Per-mode rule packs are merged automatically (`dnd` and `story`) with campaign overrides.
+- Baseline gameplay systems are implemented:
+  - dice engine with modifiers and advantage/disadvantage (`GameService.roll_dice`) plus persisted roll logs (`dice_roll_logs`)
+  - campaign ruleset management with seeded defaults (`dnd5e-2014`, `dnd5e-2024`, `story-freeform`)
+- Baseline knowledge systems are implemented:
+  - rulebook and entry storage (`rulebooks`, `rulebook_entries`)
+  - rulebook lookup/retrieval APIs used by prompts and commands (`search_rulebook_entries`, `rule_lookup_for_campaign`)
+  - seed pipeline for default gameplay/rulebook knowledge (`seed_default_gameplay_knowledge`)
+- Gameplay and Knowledge surfaces are implemented:
+  - Streamlit page `Gameplay & Knowledge` for rulesets/rulebooks/dice logs
+  - Discord commands `!showruleset`, `!setruleset`, `!rulelookup`, `!roll`
+- Formal model-evaluation regression harness is available (`scripts/model_eval_regression.py`, `scripts/model_eval_cases.json`).
+- CI gates run lint, tests, health endpoint tests, `pip-audit`, and `pip check`.
 
 ## Design notes for your goals
 
