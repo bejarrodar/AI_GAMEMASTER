@@ -727,7 +727,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
 - [ ] LLM roadmap: design and train a dedicated intent-to-JSON model specialized for command/turn parsing reliability.
 - [ ] LLM roadmap: design a dual-model architecture (`parser model` + `story model`) with separate eval suites and routing policy.
-- [ ] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
+- [x] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
 - [x] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
 - [x] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
 - [ ] Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
@@ -902,6 +902,7 @@ Already implemented:
 - One-command diagnostics bundles are implemented in `scripts/diagnostics_bundle.py` (runtime config snapshot, health checks, metrics, recent DB logs, optional local log tails, zipped artifact).
 - A benchmark suite for throughput/latency by mode (`dnd`, `story`, `crew`) is available in `scripts/benchmark_modes.py`.
 - Discord turn workers now emit periodic typing indicators while long turns are being processed.
+- LLM context packing now enforces configurable hard character budgets with truncation diagnostics (`AIGM_CONTEXT_TOKEN_BUDGET_CHARS`, `AIGM_CONTEXT_TRUNCATION_DIAGNOSTICS`).
 
 ## Design notes for your goals
 

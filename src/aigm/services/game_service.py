@@ -1119,6 +1119,8 @@ class GameService:
             max_facts=settings.context_max_facts,
             recent_turns=settings.context_recent_turns,
             turn_line_max_chars=settings.context_turn_line_max_chars,
+            token_budget_chars=settings.context_token_budget_chars,
+            include_truncation_diagnostics=bool(settings.context_truncation_diagnostics),
         )
         active_ruleset = self._ruleset_for_campaign(db, campaign)
         if active_ruleset:

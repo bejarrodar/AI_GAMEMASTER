@@ -35,6 +35,7 @@ def test_pack_for_llm_limits_facts_and_turns() -> None:
     assert len(summary_lines) <= 3
     assert "Shade" in " ".join(packed["relevant_facts"])
     assert len(packed["recent_turns"]) <= 3
+    assert "context_budget" in packed
 
 
 def test_pack_for_llm_includes_runtime_constraints() -> None:
@@ -52,6 +53,42 @@ def test_pack_for_llm_includes_runtime_constraints() -> None:
     )
     assert packed["runtime_constraints"] == ["No player can be put into inventory."]
     assert any("Constraint:" in f for f in packed["relevant_facts"])
+
+
+def test_pack_for_llm_applies_token_budget_and_reports_truncation() -> None:
+    builder = ContextBuilder()
+    state = WorldState(
+        scene="Frontier town beside ruins with many moving parts.",
+        flags={"mode": "story", "weather": "rain", "time": "dawn"},
+        party={
+            "Shade": CharacterState(name="Shade", hp=10, max_hp=10, inventory={"torch": 1, "dagger": 1, "coin": 12}),
+            "Bear": CharacterState(name="Bear", hp=10, max_hp=10, inventory={"staff": 1}),
+        },
+    )
+    turns = []
+    for i in range(8):
+        turns.append(
+            {
+                "turn_id": i + 1,
+                "actor_name": f"P{i}",
+                "user_input": f"user input {i} with extra verbosity",
+                "narration": f"narration {i} with extra verbosity to force truncation",
+            }
+        )
+    packed = builder.pack_for_llm(
+        base_context={"campaign_id": 1, "mode": "story", "conversation_history": turns},
+        state=state,
+        actor_character_name="Shade",
+        max_facts=10,
+        recent_turns=6,
+        turn_line_max_chars=120,
+        token_budget_chars=260,
+        include_truncation_diagnostics=True,
+    )
+    budget = packed.get("context_budget", {})
+    assert bool(budget.get("truncated")) is True
+    assert int(budget.get("estimated_chars_after", 0)) <= int(budget.get("budget_chars", 0))
+    assert int(budget.get("dropped_facts", 0)) >= 0
 
 
 def test_torch_relevance_higher_in_dark_context_than_daylight() -> None:

@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     context_recent_turns: int = 6
     context_max_facts: int = 12
     context_turn_line_max_chars: int = 180
+    context_token_budget_chars: int = 7000
+    context_truncation_diagnostics: bool = True
     context_memory_summary_turns: int = 20
     context_memory_max_entries: int = 5
     sys_admin_token: str = ""

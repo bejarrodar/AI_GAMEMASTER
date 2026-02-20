@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 
 from sqlalchemy.orm import Session
@@ -132,6 +133,8 @@ class ContextBuilder:
         max_facts: int = 12,
         recent_turns: int = 6,
         turn_line_max_chars: int = 180,
+        token_budget_chars: int = 0,
+        include_truncation_diagnostics: bool = True,
     ) -> dict:
         user_tokens = self._tokens(user_input)
         scene_tokens = self._tokens(state.scene)
@@ -224,7 +227,7 @@ class ContextBuilder:
             summary_lines.append(self._clip(line, turn_line_max_chars))
             recent_turn_rows.append({"actor": actor, "user_input": user_input, "narration": narration})
 
-        return {
+        payload = {
             "campaign_id": base_context.get("campaign_id"),
             "mode": mode,
             "actor_character_name": actor_character_name,
@@ -241,3 +244,80 @@ class ContextBuilder:
             "learned_effect_relevance": learned_effect_relevance or {},
             "long_term_memory": long_term_memory or [],
         }
+        return self._apply_token_budget(
+            payload=payload,
+            token_budget_chars=max(0, int(token_budget_chars)),
+            include_truncation_diagnostics=include_truncation_diagnostics,
+        )
+
+    @staticmethod
+    def _estimated_chars(payload: dict) -> int:
+        try:
+            return len(str(payload.get("turn_summary", ""))) + len(json.dumps(payload.get("relevant_facts", [])))
+        except Exception:
+            return len(str(payload))
+
+    def _apply_token_budget(
+        self,
+        *,
+        payload: dict,
+        token_budget_chars: int,
+        include_truncation_diagnostics: bool,
+    ) -> dict:
+        estimated_before = self._estimated_chars(payload)
+        diagnostics = {
+            "budget_chars": int(token_budget_chars),
+            "estimated_chars_before": int(estimated_before),
+            "estimated_chars_after": int(estimated_before),
+            "truncated": False,
+            "dropped_facts": 0,
+            "dropped_turns": 0,
+            "truncated_turn_summary": False,
+        }
+        if token_budget_chars <= 0 or estimated_before <= token_budget_chars:
+            if include_truncation_diagnostics:
+                payload["context_budget"] = diagnostics
+            return payload
+
+        facts = list(payload.get("relevant_facts", []) or [])
+        scored = list(payload.get("relevance_scored_facts", []) or [])
+        turns = list(payload.get("recent_turns", []) or [])
+        summary = str(payload.get("turn_summary", "") or "")
+
+        while self._estimated_chars(payload) > token_budget_chars and len(facts) > 1:
+            facts.pop()
+            if scored:
+                scored.pop()
+            diagnostics["dropped_facts"] = int(diagnostics["dropped_facts"]) + 1
+            diagnostics["truncated"] = True
+            payload["relevant_facts"] = facts
+            payload["relevance_scored_facts"] = scored
+
+        while self._estimated_chars(payload) > token_budget_chars and len(turns) > 1:
+            turns.pop(0)
+            diagnostics["dropped_turns"] = int(diagnostics["dropped_turns"]) + 1
+            diagnostics["truncated"] = True
+            payload["recent_turns"] = turns
+            # Rebuild summary to match reduced turns
+            rebuilt: list[str] = []
+            for row in turns:
+                actor = str(row.get("actor", "unknown"))
+                user_input = str(row.get("user_input", ""))
+                narration = str(row.get("narration", ""))
+                line = f"{actor}: {user_input}"
+                if narration:
+                    line += f" -> {narration}"
+                rebuilt.append(line)
+            summary = "\n".join(rebuilt)
+            payload["turn_summary"] = summary
+
+        if self._estimated_chars(payload) > token_budget_chars and summary:
+            keep = max(120, token_budget_chars // 3)
+            payload["turn_summary"] = self._clip(summary, keep)
+            diagnostics["truncated_turn_summary"] = True
+            diagnostics["truncated"] = True
+
+        diagnostics["estimated_chars_after"] = int(self._estimated_chars(payload))
+        if include_truncation_diagnostics:
+            payload["context_budget"] = diagnostics
+        return payload
