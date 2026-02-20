@@ -748,7 +748,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] Import/export: add granular export/import scopes (characters, rules, inventory, world, logs, memories, bots).
 - [ ] Import/export: add signed/verified backup bundles for secure transfer between threads/servers.
 - [ ] Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
-- [ ] Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
+- [x] Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
 - [ ] Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
 - [ ] Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
 - [ ] Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
@@ -771,10 +771,9 @@ All previously listed immediate items are complete. Continue with Basic Testing 
 5. API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
 6. API/platform: add OpenAPI docs for management endpoints and auth scopes.
 7. API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
-8. Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
-9. Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
-10. Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
-11. Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
+8. Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
+9. Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
+10. Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
 
 #### Nice-to-Have (scale, UX, and expansion)
 
@@ -898,6 +897,7 @@ Already implemented:
 - Formal model-evaluation regression harness is available (`scripts/model_eval_regression.py`, `scripts/model_eval_cases.json`).
 - CI gates run lint, tests, health endpoint tests, `pip-audit`, and `pip check`.
 - Chaos resilience tests now cover DB API outage/retry/circuit-breaker behavior plus Ollama outage/timeout fallback paths (`tests/test_chaos_resilience.py`).
+- Discord command contract tests now validate command surface basics, help output, pre-start command gating, and unknown-command suggestions (`tests/test_discord_command_contracts.py`).
 
 ## Design notes for your goals
 
