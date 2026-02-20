@@ -724,7 +724,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
 - [x] LLM robustness: replace heuristic purchase/currency checks with ruleset-aware transaction intent extraction (cost, currency, quantity) and explicit validation.
 - [ ] LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
-- [ ] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
+- [x] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
 - [ ] LLM roadmap: design and train a dedicated intent-to-JSON model specialized for command/turn parsing reliability.
 - [ ] LLM roadmap: design a dual-model architecture (`parser model` + `story model`) with separate eval suites and routing policy.
 - [x] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
@@ -903,6 +903,7 @@ Already implemented:
 - A benchmark suite for throughput/latency by mode (`dnd`, `story`, `crew`) is available in `scripts/benchmark_modes.py`.
 - Discord turn workers now emit periodic typing indicators while long turns are being processed.
 - LLM context packing now enforces configurable hard character budgets with truncation diagnostics (`AIGM_CONTEXT_TOKEN_BUDGET_CHARS`, `AIGM_CONTEXT_TRUNCATION_DIAGNOSTICS`).
+- Command suggestion routing now enforces minimum LLM confidence (`AIGM_COMMAND_SUGGESTION_MIN_CONFIDENCE`) and uses string-similarity only as last-resort fallback.
 
 ## Design notes for your goals
 

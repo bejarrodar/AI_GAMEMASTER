@@ -205,3 +205,34 @@ def test_pickup_unresolved_check_triggers_explicit_assessment(monkeypatch) -> No
     assert result["accepted"]
     assert result["accepted"][0].type == "add_item"
     assert result["accepted"][0].key == "dagger"
+
+
+def test_command_inference_enforces_llm_confidence_threshold(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setattr(settings, "command_suggestion_min_confidence", 0.9)
+    monkeypatch.setattr(
+        LLMAdapter,
+        "_infer_discord_command_with_openai",
+        lambda _self, _input, _possible: {"matched_command": "!mycharacter", "confidence": 0.4, "reason": "llm_guess"},
+    )
+    monkeypatch.setattr(
+        LLMAdapter,
+        "_fallback_infer_discord_command",
+        staticmethod(lambda _input, _possible: {"matched_command": None, "confidence": 0.0, "reason": "no_match"}),
+    )
+    adapter = LLMAdapter()
+    out = adapter.infer_discord_command("!mycharcter hero", ["!mycharacter", "!gmhelp"])
+    assert out["matched_command"] is None
+
+
+def test_command_inference_accepts_high_confidence_llm_guess(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setattr(settings, "command_suggestion_min_confidence", 0.7)
+    monkeypatch.setattr(
+        LLMAdapter,
+        "_infer_discord_command_with_openai",
+        lambda _self, _input, _possible: {"matched_command": "!mycharacter", "confidence": 0.92, "reason": "llm_guess"},
+    )
+    adapter = LLMAdapter()
+    out = adapter.infer_discord_command("!mycharcter hero", ["!mycharacter", "!gmhelp"])
+    assert out["matched_command"] == "!mycharacter"

@@ -1679,13 +1679,25 @@ class LLMAdapter:
         return {"matched_command": matched, "confidence": max(0.0, min(1.0, confidence)), "reason": reason}
 
     def infer_discord_command(self, user_input: str, possible_commands: list[str]) -> dict:
+        min_conf = max(0.0, min(1.0, float(settings.command_suggestion_min_confidence)))
+
+        def _acceptable(guess: dict) -> bool:
+            matched = str(guess.get("matched_command", "") or "").strip()
+            if not matched:
+                return False
+            try:
+                conf = float(guess.get("confidence", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            return conf >= min_conf
+
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
             if self._circuit_is_open("ollama"):
                 return self._fallback_infer_discord_command(user_input, possible_commands)
             try:
                 guessed = self._infer_discord_command_with_ollama(user_input, possible_commands)
-                if guessed.get("matched_command"):
+                if _acceptable(guessed):
                     self._record_provider_success("ollama")
                     return guessed
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
@@ -1696,7 +1708,7 @@ class LLMAdapter:
                 return self._fallback_infer_discord_command(user_input, possible_commands)
             try:
                 guessed = self._infer_discord_command_with_openai(user_input, possible_commands)
-                if guessed.get("matched_command"):
+                if _acceptable(guessed):
                     self._record_provider_success("openai")
                     return guessed
             except Exception as exc:  # noqa: BLE001

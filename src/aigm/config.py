@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     llm_json_mode_strict: bool = True
     llm_http_max_retries: int = 2
     llm_http_retry_backoff_s: float = 0.75
+    command_suggestion_min_confidence: float = 0.72
     story_fast_review_bypass: bool = True
     review_precheck_enabled: bool = True
     context_recent_turns: int = 6
