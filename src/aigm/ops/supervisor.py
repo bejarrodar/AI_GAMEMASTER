@@ -599,6 +599,10 @@ class ManagementState:
             window_s=settings.management_api_mutation_rate_limit_window_s,
             max_requests=settings.management_api_mutation_rate_limit_max_requests,
         )
+        self.debug_limiter = APIRateLimiter(
+            window_s=settings.management_api_debug_rate_limit_window_s,
+            max_requests=settings.management_api_debug_rate_limit_max_requests,
+        )
         self._idempotency_lock = threading.Lock()
         self._idempotency_cache: dict[str, dict] = {}
 
@@ -1438,12 +1442,16 @@ def make_management_handler(state: ManagementState):
             auth = str(self.headers.get("Authorization", "") or "")
             return f"{remote}|{auth[:32]}"
 
-        def _check_rate_limit(self, is_mutation: bool = False) -> bool:
+        def _check_rate_limit(self, *, path: str, is_mutation: bool = False) -> bool:
             key = self._request_key()
             request_limiter = getattr(state, "request_limiter", None)
             mutation_limiter = getattr(state, "mutation_limiter", None)
+            debug_limiter = getattr(state, "debug_limiter", None)
             if request_limiter is not None and not request_limiter.allow(key):
                 self._error(429, "rate_limited", "rate_limited", {"scope": "management_api"})
+                return False
+            if path.startswith("/api/v1/debug/") and debug_limiter is not None and not debug_limiter.allow(key):
+                self._error(429, "rate_limited", "rate_limited", {"scope": "management_api_debug"})
                 return False
             if is_mutation and mutation_limiter is not None and not mutation_limiter.allow(key):
                 self._error(429, "rate_limited", "rate_limited", {"scope": "management_api_mutation"})
@@ -1452,14 +1460,14 @@ def make_management_handler(state: ManagementState):
 
         def do_GET(self):  # noqa: N802
             self._bind_correlation_id()
+            parsed = urlparse(self.path)
+            path = parsed.path
             if not self._require_auth():
                 self._clear_db_api_correlation()
                 return
-            if not self._check_rate_limit(is_mutation=False):
+            if not self._check_rate_limit(path=path, is_mutation=False):
                 self._clear_db_api_correlation()
                 return
-            parsed = urlparse(self.path)
-            path = parsed.path
             query = parse_qs(parsed.query)
             try:
                 if path == "/api/v1/meta":
@@ -1587,14 +1595,14 @@ def make_management_handler(state: ManagementState):
 
         def do_POST(self):  # noqa: N802
             self._bind_correlation_id()
+            parsed = urlparse(self.path)
+            path = parsed.path
             if not self._require_auth():
                 self._clear_db_api_correlation()
                 return
-            if not self._check_rate_limit(is_mutation=True):
+            if not self._check_rate_limit(path=path, is_mutation=True):
                 self._clear_db_api_correlation()
                 return
-            parsed = urlparse(self.path)
-            path = parsed.path
             try:
                 payload = self._read_json()
                 idem_key = self._idempotency_key()
@@ -1867,14 +1875,14 @@ def make_management_handler(state: ManagementState):
 
         def do_PUT(self):  # noqa: N802
             self._bind_correlation_id()
+            parsed = urlparse(self.path)
+            path = parsed.path
             if not self._require_auth():
                 self._clear_db_api_correlation()
                 return
-            if not self._check_rate_limit(is_mutation=True):
+            if not self._check_rate_limit(path=path, is_mutation=True):
                 self._clear_db_api_correlation()
                 return
-            parsed = urlparse(self.path)
-            path = parsed.path
             try:
                 payload = self._read_json()
                 idem_key = self._idempotency_key()
@@ -1942,14 +1950,14 @@ def make_management_handler(state: ManagementState):
 
         def do_DELETE(self):  # noqa: N802
             self._bind_correlation_id()
+            parsed = urlparse(self.path)
+            path = parsed.path
             if not self._require_auth():
                 self._clear_db_api_correlation()
                 return
-            if not self._check_rate_limit(is_mutation=True):
+            if not self._check_rate_limit(path=path, is_mutation=True):
                 self._clear_db_api_correlation()
                 return
-            parsed = urlparse(self.path)
-            path = parsed.path
             try:
                 idem_key = self._idempotency_key()
                 fingerprint = self._fingerprint({})

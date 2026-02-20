@@ -84,6 +84,8 @@ class Settings(BaseSettings):
     management_api_rate_limit_max_requests: int = 180
     management_api_mutation_rate_limit_window_s: int = 60
     management_api_mutation_rate_limit_max_requests: int = 60
+    management_api_debug_rate_limit_window_s: int = 60
+    management_api_debug_rate_limit_max_requests: int = 20
     alert_turn_stall_s: int = 120
     alert_turn_stall_queue_depth: int = 1
     alert_fallback_window_s: int = 300

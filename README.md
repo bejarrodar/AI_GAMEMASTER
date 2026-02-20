@@ -704,7 +704,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [x] API/platform: add OpenAPI docs for management endpoints and auth scopes.
 - [x] API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
 - [ ] API/platform: add inter-service auth scope separation (distinct tokens/scopes per component, token rotation workflow).
-- [ ] API/platform: add API rate limiting and per-endpoint quotas for management/debug surfaces.
+- [x] API/platform: add API rate limiting and per-endpoint quotas for management/debug surfaces.
 - [x] API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
 - [x] API/platform: add service-to-service retry/circuit-breaker policy with consistent error envelope across APIs.
 - [x] API/platform: add event/audit correlation IDs propagated across API hops (bot -> management -> db_api).
@@ -862,6 +862,7 @@ Already implemented:
 - Turn success/failure counters and latency sums are exported on `/metrics` (plus log queue depth gauge).
 - Streamlit UI now uses Management/DB APIs for campaign/gameplay/auth/admin operations without direct `SessionLocal` DB access in the UI layer.
 - Management API now includes rate limits for read and mutation paths (`AIGM_MANAGEMENT_API_RATE_LIMIT_*`).
+- Management API debug surfaces now have dedicated per-endpoint quota controls (`AIGM_MANAGEMENT_API_DEBUG_RATE_LIMIT_*`) in addition to global read/mutation limits.
 - Discord turn handling now uses a bounded async worker queue (`AIGM_TURN_WORKER_QUEUE_MAX`, `AIGM_TURN_WORKER_COUNT`) with graceful queue-full responses.
 - LLM provider circuit-breaker safeguards are implemented (`AIGM_LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `AIGM_LLM_CIRCUIT_BREAKER_RESET_S`).
 - Logging coverage checklist documentation is available at `docs/LOGGING_COVERAGE_CHECKLIST.md`.

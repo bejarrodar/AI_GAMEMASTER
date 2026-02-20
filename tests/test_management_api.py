@@ -373,3 +373,33 @@ def test_management_mutation_idempotency_key_replays_response() -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_management_debug_rate_limit_scope() -> None:
+    state = _State()
+    state.request_limiter = supervisor.APIRateLimiter(window_s=60, max_requests=100)
+    state.mutation_limiter = supervisor.APIRateLimiter(window_s=60, max_requests=100)
+    state.debug_limiter = supervisor.APIRateLimiter(window_s=60, max_requests=1)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), supervisor.make_management_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        req1 = request.Request(f"{base}/api/v1/debug/checks/db", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
+        with request.urlopen(req1, timeout=3) as resp:
+            payload1 = json.loads(resp.read().decode("utf-8"))
+        assert payload1["ok"] is True
+
+        req2 = request.Request(f"{base}/api/v1/debug/checks/db", method="POST", data=b"{}", headers={"Content-Type": "application/json"})
+        try:
+            with request.urlopen(req2, timeout=3):
+                pass
+            raise AssertionError("expected debug rate limit")
+        except error.HTTPError as exc:
+            assert exc.code == 429
+            payload2 = json.loads(exc.read().decode("utf-8"))
+            assert payload2["error_code"] == "rate_limited"
+            assert payload2["error_details"]["scope"] == "management_api_debug"
+    finally:
+        server.shutdown()
+        server.server_close()
