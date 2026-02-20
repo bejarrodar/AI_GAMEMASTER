@@ -55,6 +55,17 @@ class Feedback(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow)
 
 
+class ProcessedDiscordMessage(Base):
+    __tablename__ = "processed_discord_messages"
+    __table_args__ = (UniqueConstraint("discord_message_id", name="uq_processed_discord_message_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    campaign_id: Mapped[int | None] = mapped_column(ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True, index=True)
+    discord_message_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    actor_discord_user_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+
+
 class Player(Base):
     __tablename__ = "players"
     __table_args__ = (UniqueConstraint("campaign_id", "discord_user_id", name="uq_player_campaign_discord_user"),)

@@ -47,6 +47,51 @@ function Ensure-Command {
     }
 }
 
+function Invoke-DbEnsureAndHeal {
+    param(
+        [string]$PythonExe,
+        [int]$MaxAttempts = 4
+    )
+
+    $attempt = 1
+    while ($attempt -le $MaxAttempts) {
+        try {
+            Write-Host "  [db] ensure/heal attempt $attempt/$MaxAttempts ..."
+            & $PythonExe -m aigm.db.bootstrap
+            if ($LASTEXITCODE -ne 0) {
+                throw "db.bootstrap exited with code $LASTEXITCODE"
+            }
+
+            $verifyScript = @'
+from sqlalchemy import inspect
+from aigm.db.session import engine
+
+inspector = inspect(engine)
+if not inspector.has_table("campaigns"):
+    raise SystemExit("campaigns table missing after bootstrap")
+columns = {c["name"] for c in inspector.get_columns("campaigns")}
+if "version" not in columns:
+    raise SystemExit("campaigns.version is still missing after bootstrap")
+print("[startup] database schema verified (campaigns.version present)")
+'@
+            $verifyScript | & $PythonExe -
+            if ($LASTEXITCODE -ne 0) {
+                throw "schema verification failed with code $LASTEXITCODE"
+            }
+            return
+        }
+        catch {
+            if ($attempt -ge $MaxAttempts) {
+                throw "Database ensure/heal failed after $MaxAttempts attempts. $($_.Exception.Message)"
+            }
+            Write-Warning "Database ensure/heal attempt $attempt failed: $($_.Exception.Message)"
+            Write-Warning "Retrying in 2 seconds. Ensure Streamlit/bot processes are stopped and DB file is not locked."
+            Start-Sleep -Seconds 2
+            $attempt++
+        }
+    }
+}
+
 Write-Host "1/9 Setting up Python environment..."
 & ".\scripts\setup_local_test_env.ps1" -VenvPath $VenvPath
 
@@ -134,7 +179,7 @@ Write-Host "5/9 Pulling Ollama model: $OllamaModel ..."
 ollama pull $OllamaModel
 
 Write-Host "6/9 Validating database schema and backend defaults..."
-& $pythonExe -m aigm.db.bootstrap
+Invoke-DbEnsureAndHeal -PythonExe $pythonExe -MaxAttempts 4
 
 $seedValidationScript = @'
 from aigm.adapters.llm import LLMAdapter

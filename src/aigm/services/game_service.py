@@ -5,10 +5,13 @@ import hashlib
 import hmac
 import re
 import secrets
+import traceback
+import uuid
 from datetime import datetime
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
+from pydantic import BaseModel, ValidationError
 
 from aigm.adapters.llm import LLMAdapter
 from aigm.agents.crew import CrewOrchestrator
@@ -40,15 +43,23 @@ from aigm.db.models import (
     ItemKnowledge,
     ItemObservation,
     Player,
+    ProcessedDiscordMessage,
     Rulebook,
     RulebookEntry,
     SysAdminUser,
     TurnLog,
 )
+from aigm.ops.db_api_client import DBApiClient
 from aigm.schemas.game import CharacterState, Command, PlayerIntentExtraction, WorldState
 
 
+class AIRawOutputEnvelope(BaseModel):
+    schema_version: int = 2
+    source: str
+
+
 class GameService:
+    AI_RAW_OUTPUT_SCHEMA_VERSION = 2
     DEFAULT_PERMISSIONS: dict[str, str] = {
         "campaign.read": "View campaigns and state.",
         "campaign.play": "Submit player turns.",
@@ -311,6 +322,11 @@ class GameService:
         self.llm = llm
         self.context_builder = ContextBuilder()
         self.crew = CrewOrchestrator(llm)
+        self.db_api = DBApiClient(settings.db_api_url, token=settings.db_api_token)
+
+    @staticmethod
+    def _new_turn_correlation_id() -> str:
+        return uuid.uuid4().hex
 
     @staticmethod
     def _tokenize_for_search(text: str) -> list[str]:
@@ -615,11 +631,39 @@ class GameService:
 
     @staticmethod
     def _is_purchase_attempt(user_input: str) -> bool:
-        return bool(re.search(r"\b(buy|purchase|pay|paid|spend)\b", user_input.lower()))
+        return bool(re.search(r"\b(buy|purchase|pay|paid|spend)\b", (user_input or "").lower()))
 
     @classmethod
     def _has_currency(cls, inventory: dict[str, int]) -> bool:
-        return any((k.lower() in cls.MONEY_ITEM_KEYS and v > 0) for k, v in inventory.items())
+        return any((k.lower() in cls.MONEY_ITEM_KEYS and v > 0) for k, v in (inventory or {}).items())
+
+    @staticmethod
+    def _normalize_currency_item_key(currency: str) -> str:
+        raw = (currency or "").strip().lower().replace(" ", "_")
+        aliases = {
+            "gold": "gold_coins",
+            "coin": "coins",
+            "coins": "coins",
+            "gold_coin": "gold_coins",
+            "gold_coins": "gold_coins",
+            "silver": "silver_coins",
+            "silver_coin": "silver_coins",
+            "silver_coins": "silver_coins",
+        }
+        return aliases.get(raw, raw)
+
+    @classmethod
+    def _currency_amount(cls, inventory: dict[str, int], currency: str) -> int:
+        key = cls._normalize_currency_item_key(currency)
+        if not key:
+            return 0
+        return int((inventory or {}).get(key, 0))
+
+    @staticmethod
+    def _is_shop_context(scene: str, user_input: str) -> bool:
+        text = f"{scene} {user_input}".lower()
+        hints = ("shop", "merchant", "vendor", "store", "market", "counter", "guild trader")
+        return any(h in text for h in hints)
 
     @staticmethod
     def _actor_inventory_for_context(db: Session, campaign: Campaign, actor_discord_user_id: str, state: WorldState) -> dict[str, int]:
@@ -658,6 +702,11 @@ class GameService:
         first = infeasible[0]
         reason = first.reason.strip() or "That action is not possible in the current state."
         return f"You attempt the action, but it fails: {reason}"
+
+    @staticmethod
+    def _requires_explicit_feasibility_resolution(check) -> bool:
+        reason = (check.reason or "").strip().lower()
+        return "requires explicit feasibility assessment" in reason
 
     @staticmethod
     def _dedupe_rejections(rows: list[dict]) -> list[dict]:
@@ -723,6 +772,61 @@ class GameService:
             return text
         speaker = (speaker_name or "Player").strip() or "Player"
         return f'{speaker} says: "{spoken}"'
+
+    @staticmethod
+    def _format_inventory_list(inventory: dict[str, int]) -> str:
+        rows = [(k, int(v)) for k, v in (inventory or {}).items() if int(v) > 0]
+        if not rows:
+            return ""
+        rows.sort(key=lambda item: item[0])
+        return ", ".join(f"{qty} {key.replace('_', ' ')}" for key, qty in rows)
+
+    def _self_inspection_narration(
+        self, state: WorldState, actor_character_name: str | None, user_input: str
+    ) -> str | None:
+        if not actor_character_name:
+            return None
+        char = state.party.get(actor_character_name)
+        if not char:
+            return None
+        text = (user_input or "").strip().lower()
+        if not text:
+            return None
+
+        asks_appearance = any(
+            phrase in text
+            for phrase in (
+                "what do i look like",
+                "how do i look",
+                "describe me",
+                "my appearance",
+                "what am i wearing",
+            )
+        )
+        if asks_appearance:
+            if char.description.strip():
+                return f"You are **{char.name}**. {char.description.strip()}"
+            return f"You are **{char.name}**. Your appearance is still undefined."
+
+        asks_equipment = any(
+            phrase in text
+            for phrase in (
+                "what am i equipped with",
+                "what am i equipped wi th",
+                "what am i carrying",
+                "what do i have equipped",
+                "show my inventory",
+                "what is in my inventory",
+                "what do i have in my inventory",
+                "what am i holding",
+            )
+        )
+        if asks_equipment:
+            items = self._format_inventory_list(char.inventory)
+            if items:
+                return f"You are currently carrying: {items}."
+            return "You are not carrying any items right now."
+        return None
 
     @staticmethod
     def _full_conversation_for_context(db: Session, campaign: Campaign) -> list[dict]:
@@ -1869,7 +1973,40 @@ class GameService:
         party_names_ci = {name.lower(): name for name in current_state.party.keys()}
         purchase_attempt = self._is_purchase_attempt(user_input)
         has_funds = self._has_currency(actor.inventory) if actor else False
+        in_shop = self._is_shop_context(current_state.scene, user_input)
+        if actor:
+            missing_item = self._first_missing_personal_item(user_input, set(actor.inventory.keys()))
+            if missing_item:
+                check = self._find_intent_feasibility_check(intent, "use", missing_item, None)
+                if check is None:
+                    assessed = self.llm.assess_inventory_action_feasibility(
+                        action="use",
+                        item_key=missing_item,
+                        scene=current_state.scene,
+                        user_input=user_input,
+                        state_json=current_state.model_dump_json(),
+                        context_json=json.dumps(
+                            {
+                                "actor_name": actor_name or "",
+                                "actor_inventory": actor.inventory,
+                                "inventory_count": int(actor.inventory.get(missing_item, 0)),
+                            }
+                        ),
+                    )
+                    is_possible = bool(assessed.get("is_possible", False))
+                    reason = str(assessed.get("reason", "") or "").strip()
+                    if int(actor.inventory.get(missing_item, 0)) <= 0:
+                        is_possible = False
+                        if not reason:
+                            reason = f"'{missing_item}' is not currently in the actor inventory."
+                    if not is_possible:
+                        constraints.append(
+                            f"Can the actor use '{missing_item}' from inventory right now? -> NO. "
+                            f"{reason or 'Usage is not possible under current inventory state.'}"
+                        )
         for check in intent.feasibility_checks:
+            if self._requires_explicit_feasibility_resolution(check):
+                continue
             if not check.is_possible:
                 msg = check.reason.strip() or "Action is not possible in the current state."
                 constraints.append(f"{check.question} -> NO. {msg}")
@@ -1877,7 +2014,15 @@ class GameService:
             item_key = row.item_key.strip().lower()
             if not item_key:
                 continue
-            if row.action in {"add", "pickup"} and self._is_deterministically_non_portable(item_key):
+            check = self._find_intent_feasibility_check(intent, row.action, item_key, row.target_character)
+            if check and check.portability == "non_portable":
+                constraints.append(
+                    f"'{item_key}' is non-portable and cannot be placed into inventory. "
+                    "Narrate an attempted action that fails in-world."
+                )
+                continue
+            # Legacy deterministic guard only when LLM intent did not provide portability.
+            if check is None and row.action in {"add", "pickup"} and self._is_deterministically_non_portable(item_key):
                 constraints.append(
                     f"'{item_key}' is non-portable and cannot be placed into inventory. "
                     "Narrate an attempted action that fails in-world."
@@ -1893,17 +2038,44 @@ class GameService:
                         "Narrate the shove/attempt failing and keep character placement unchanged."
                     )
                     continue
-                if purchase_attempt and not has_funds:
+                if check and check.requires_payment and check.has_required_funds is False:
+                    constraints.append(
+                        f"Transaction failed: insufficient funds for '{item_key}'"
+                        + (f" ({check.cost_amount} {check.currency})" if check.cost_amount is not None and check.currency else "")
+                        + ". Narrate the attempt and refusal/payment failure."
+                    )
+                    continue
+                if check and check.requires_payment and check.cost_amount is not None and check.currency and actor:
+                    have_amt = self._currency_amount(actor.inventory, check.currency)
+                    need_amt = int(check.cost_amount)
+                    if have_amt < need_amt:
+                        constraints.append(
+                            f"Transaction failed: insufficient funds for '{item_key}' ({need_amt} {check.currency}). "
+                            f"Actor has {have_amt} {check.currency}."
+                        )
+                        continue
+                if in_shop and not purchase_attempt:
+                    theft = bool(check.would_be_theft) if check is not None else True
+                    if theft:
+                        constraints.append(
+                            f"Taking '{item_key}' without buying it in this shop context would be theft. "
+                            "Narrate a denied attempt or consequences, not a free inventory gain."
+                        )
+                        continue
+                # Legacy transaction fallback if model omitted explicit transaction fields.
+                if check is None and purchase_attempt and not has_funds:
                     constraints.append(
                         f"Purchase attempt failed: you do not have currency in your inventory to buy '{item_key}'. "
                         "Narrate the attempt and refusal/payment failure."
                     )
                     continue
             if row.action in {"use", "remove"} and row.owner in {"self", "unknown"} and actor:
-                if actor.inventory.get(item_key, 0) < row.quantity:
+                have = int(actor.inventory.get(item_key, 0))
+                need = int(row.quantity)
+                if have < need:
                     constraints.append(
-                        f"You can't use '{item_key}' because it is not in your inventory. "
-                        "Narrate an attempted action that fails naturally."
+                        f"Can the actor use '{item_key}' from inventory right now? -> NO. "
+                        f"Inventory count is {have}, required is {need}."
                     )
             if row.action == "steal":
                 if not row.target_character:
@@ -1934,6 +2106,24 @@ class GameService:
         if not matching:
             return True
         return all(c.is_possible for c in matching)
+
+    @staticmethod
+    def _find_intent_feasibility_check(
+        intent: PlayerIntentExtraction, action: str, item_key: str, target: str | None
+    ):
+        action_l = action.lower()
+        item_l = item_key.lower()
+        target_l = (target or "").lower()
+        for c in intent.feasibility_checks:
+            if c.action.lower() != action_l:
+                continue
+            if c.item_key.lower() != item_l:
+                continue
+            c_target = (c.target_character or "").lower()
+            if c_target and c_target != target_l:
+                continue
+            return c
+        return None
 
     @staticmethod
     def _is_deterministically_non_portable(item_key: str) -> bool:
@@ -1983,29 +2173,70 @@ class GameService:
 
         commands: list[Command] = []
         added_items: list[tuple[str, int]] = []
+        in_shop = self._is_shop_context(current_state.scene, user_input)
         purchase_attempt = self._is_purchase_attempt(user_input)
-        has_funds = self._has_currency(current_state.party[actor_name].inventory)
         for row in intent.inventory:
             item_key = row.item_key.strip().lower()
             if not item_key:
                 continue
-            if row.action in {"add", "pickup"} and self._is_deterministically_non_portable(item_key):
-                continue
             if row.action == "add" and row.owner in {"self", "unknown"}:
-                if purchase_attempt and not has_funds:
+                check = self._find_intent_feasibility_check(intent, "add", item_key, row.target_character)
+                if check is not None and not check.is_possible:
                     continue
-                if not self._is_intent_action_feasible(intent, "add", item_key, row.target_character):
+                if check is not None and check.requires_payment and check.has_required_funds is False:
+                    continue
+                if check is None:
+                    assessed = self.llm.assess_inventory_action_feasibility(
+                        action="add",
+                        item_key=item_key,
+                        scene=current_state.scene,
+                        user_input=user_input,
+                        state_json=current_state.model_dump_json(),
+                        context_json="{}",
+                    )
+                    if not bool(assessed.get("is_possible", False)):
+                        continue
+                    if in_shop and not purchase_attempt and bool(assessed.get("would_be_theft", True)):
+                        continue
+                if check is not None and in_shop and not purchase_attempt and bool(check.would_be_theft):
+                    continue
+                if check is not None and check.requires_payment:
+                    currency = str(check.currency or "").strip().lower()
+                    cost = int(check.cost_amount) if check.cost_amount is not None else None
+                    if currency and cost is not None:
+                        have_amt = self._currency_amount(current_state.party[actor_name].inventory, currency)
+                        if have_amt < cost:
+                            continue
+                qty = max(1, row.quantity)
+                commands.append(Command(type="add_item", target=actor_name, key=item_key, amount=qty))
+                added_items.append((item_key, qty))
+                if check is not None and check.requires_payment and check.cost_amount is not None and check.currency:
+                    commands.append(
+                        Command(
+                            type="remove_item",
+                            target=actor_name,
+                            key=self._normalize_currency_item_key(check.currency),
+                            amount=max(1, int(check.cost_amount)),
+                        )
+                    )
+            elif row.action == "pickup" and row.owner in {"scene", "unknown"}:
+                check = self._find_intent_feasibility_check(intent, "pickup", item_key, row.target_character)
+                if check is None or self._requires_explicit_feasibility_resolution(check):
+                    assessed = self.llm.assess_inventory_action_feasibility(
+                        action="pickup",
+                        item_key=item_key,
+                        scene=current_state.scene,
+                        user_input=user_input,
+                        state_json=current_state.model_dump_json(),
+                        context_json="{}",
+                    )
+                    if not bool(assessed.get("is_possible", False)):
+                        continue
+                elif check is not None and not check.is_possible:
                     continue
                 qty = max(1, row.quantity)
                 commands.append(Command(type="add_item", target=actor_name, key=item_key, amount=qty))
                 added_items.append((item_key, qty))
-            elif row.action == "pickup" and row.owner in {"scene", "unknown"}:
-                if not self._is_intent_action_feasible(intent, "pickup", item_key, row.target_character):
-                    continue
-                if self._can_find_item_in_scene(current_state.scene, item_key):
-                    qty = max(1, row.quantity)
-                    commands.append(Command(type="add_item", target=actor_name, key=item_key, amount=qty))
-                    added_items.append((item_key, qty))
 
         if not commands:
             return None
@@ -2017,12 +2248,46 @@ class GameService:
             "narration": f"You place {pretty_items} into your inventory.",
         }
 
-    def get_or_create_campaign(self, db: Session, thread_id: str, mode: str = "dnd") -> Campaign:
+    def get_or_create_campaign(
+        self,
+        db: Session,
+        thread_id: str,
+        mode: str = "dnd",
+        thread_name: str | None = None,
+    ) -> Campaign:
         self.seed_default_auth(db)
         self.seed_default_agency_rules(db)
         self.seed_default_gameplay_knowledge(db)
+
+        if settings.gameplay_use_db_api:
+            try:
+                row = self.db_api.campaign_by_thread(thread_id)
+                if row is None:
+                    generated_state = self.llm.generate_world_seed(mode=mode)
+                    row = self.db_api.upsert_campaign_by_thread(
+                        thread_id=thread_id,
+                        mode=mode,
+                        state=generated_state.model_dump(),
+                    )
+                campaign = db.query(Campaign).filter(Campaign.id == int(row["id"])).one_or_none() if row else None
+                if campaign:
+                    name = (thread_name or "").strip()
+                    if name:
+                        existing = self.list_rules(db, campaign).get("thread_name", "").strip()
+                        if existing != name:
+                            self.set_rule(db, campaign, "thread_name", name)
+                    return campaign
+            except Exception:
+                # Fallback to local DB path if API is unavailable or not aligned.
+                pass
+
         campaign = db.query(Campaign).filter(Campaign.discord_thread_id == thread_id).one_or_none()
         if campaign:
+            name = (thread_name or "").strip()
+            if name:
+                existing = self.list_rules(db, campaign).get("thread_name", "").strip()
+                if existing != name:
+                    self.set_rule(db, campaign, "thread_name", name)
             return campaign
 
         generated_state = self.llm.generate_world_seed(mode=mode)
@@ -2030,6 +2295,9 @@ class GameService:
         db.add(campaign)
         db.commit()
         db.refresh(campaign)
+        name = (thread_name or "").strip()
+        if name:
+            self.set_rule(db, campaign, "thread_name", name)
         return campaign
 
     def seed_default_agency_rules(self, db: Session) -> None:
@@ -2147,7 +2415,7 @@ class GameService:
         campaign: Campaign,
         player: Player,
         description: str,
-    ) -> str:
+    ) -> CharacterState:
         current_state = WorldState.model_validate(campaign.state)
         suggested = self.llm.generate_character_from_description(description, fallback_name=player.display_name)
 
@@ -2194,8 +2462,9 @@ class GameService:
                     effects=[e.model_dump() for e in suggested.effects],
                 )
             )
+        self.sync_inventory_for_player(db, player, current_state)
         db.commit()
-        return unique_name
+        return suggested
 
     def delete_player_character(self, db: Session, campaign: Campaign, player: Player) -> tuple[bool, str]:
         current_state = WorldState.model_validate(campaign.state)
@@ -2263,6 +2532,11 @@ class GameService:
         return [r.rule_id for r in db.query(AgencyRuleBlock).filter(AgencyRuleBlock.is_enabled.is_(True)).all()]
 
     def list_rules(self, db: Session, campaign: Campaign) -> dict[str, str]:
+        if settings.gameplay_use_db_api:
+            try:
+                return self.db_api.campaign_rules(int(campaign.id))
+            except Exception:
+                pass
         rows = db.query(CampaignRule).filter(CampaignRule.campaign_id == campaign.id).all()
         return {r.rule_key: r.rule_value for r in rows}
 
@@ -2580,6 +2854,176 @@ class GameService:
         )
         db.commit()
 
+    @staticmethod
+    def _normalize_ai_raw_output_payload(payload: dict | None) -> dict:
+        candidate = dict(payload or {})
+        schema_version = int(candidate.get("schema_version", 1) or 1)
+        if schema_version <= 1:
+            if not str(candidate.get("source", "")).strip():
+                candidate["source"] = "migrated_unknown"
+            candidate["_migrated_from_schema_version"] = schema_version
+            candidate["schema_version"] = GameService.AI_RAW_OUTPUT_SCHEMA_VERSION
+        else:
+            candidate.setdefault("schema_version", schema_version)
+            if not str(candidate.get("source", "")).strip():
+                candidate["source"] = "unknown"
+        return candidate
+
+    @staticmethod
+    def deserialize_ai_raw_output(raw: str | dict | None) -> dict:
+        try:
+            if isinstance(raw, dict):
+                parsed = dict(raw)
+            elif isinstance(raw, str):
+                parsed = json.loads(raw) if raw.strip() else {}
+            elif raw is None:
+                parsed = {}
+            else:
+                parsed = {"value": str(raw)}
+            if not isinstance(parsed, dict):
+                parsed = {"value": str(parsed)}
+            candidate = GameService._normalize_ai_raw_output_payload(parsed)
+            AIRawOutputEnvelope.model_validate(candidate)
+            return candidate
+        except Exception as exc:  # noqa: BLE001
+            fallback = {
+                "schema_version": GameService.AI_RAW_OUTPUT_SCHEMA_VERSION,
+                "source": "serialization_error",
+                "error": str(exc),
+                "raw_payload": raw if isinstance(raw, dict) else {"value": str(raw)},
+            }
+            return fallback
+
+    @staticmethod
+    def serialize_ai_raw_output(payload: dict | None) -> str:
+        candidate = GameService.deserialize_ai_raw_output(payload or {})
+        try:
+            AIRawOutputEnvelope.model_validate(candidate)
+        except ValidationError as exc:
+            candidate = {
+                "schema_version": GameService.AI_RAW_OUTPUT_SCHEMA_VERSION,
+                "source": "serialization_error",
+                "error": str(exc),
+                "raw_payload": payload if isinstance(payload, dict) else {"value": str(payload)},
+            }
+        return json.dumps(candidate)
+
+    def reserve_discord_message_idempotency(
+        self,
+        db: Session,
+        *,
+        campaign: Campaign | None,
+        discord_message_id: str,
+        actor_discord_user_id: str,
+    ) -> bool:
+        msg_id = (discord_message_id or "").strip()
+        actor_id = (actor_discord_user_id or "").strip()
+        if not msg_id or not actor_id:
+            return False
+        if settings.gameplay_use_db_api:
+            try:
+                return self.db_api.reserve_idempotency(
+                    campaign_id=(campaign.id if campaign else None),
+                    discord_message_id=msg_id,
+                    actor_discord_user_id=actor_id,
+                )
+            except Exception:
+                pass
+        exists = (
+            db.query(ProcessedDiscordMessage)
+            .filter(ProcessedDiscordMessage.discord_message_id == msg_id)
+            .one_or_none()
+        )
+        if exists:
+            return False
+        db.add(
+            ProcessedDiscordMessage(
+                campaign_id=campaign.id if campaign else None,
+                discord_message_id=msg_id,
+                actor_discord_user_id=actor_id,
+            )
+        )
+        db.commit()
+        return True
+
+    def report_player_issue(
+        self,
+        db: Session,
+        *,
+        campaign: Campaign,
+        actor_discord_user_id: str,
+        actor_display_name: str,
+        message: str,
+    ) -> tuple[bool, str]:
+        issue_text = (message or "").strip()
+        if not issue_text:
+            return False, "Issue text is required."
+        try:
+            state = WorldState.model_validate(campaign.state)
+            player = (
+                db.query(Player)
+                .filter(Player.campaign_id == campaign.id, Player.discord_user_id == actor_discord_user_id)
+                .one_or_none()
+            )
+            actor_character_name = (
+                self.player_character_name(db, campaign_id=campaign.id, player_id=player.id) if player else None
+            )
+            actor_character = state.party.get(actor_character_name) if actor_character_name else None
+            recent_turns = (
+                db.query(TurnLog)
+                .filter(TurnLog.campaign_id == campaign.id)
+                .order_by(TurnLog.id.desc())
+                .limit(8)
+                .all()
+            )
+            recent_payload = [
+                {
+                    "turn_id": t.id,
+                    "actor": t.actor,
+                    "user_input": t.user_input,
+                    "narration": t.narration,
+                    "created_at": t.created_at.isoformat() if t.created_at else "",
+                }
+                for t in reversed(recent_turns)
+            ]
+            actor_snapshot = None
+            if actor_character:
+                actor_snapshot = {
+                    "name": actor_character.name,
+                    "description": actor_character.description,
+                    "hp": actor_character.hp,
+                    "max_hp": actor_character.max_hp,
+                    "stats": actor_character.stats,
+                    "inventory": actor_character.inventory,
+                    "effects": [e.model_dump() for e in actor_character.effects],
+                }
+            audit_row = AdminAuditLog(
+                actor_source="discord",
+                actor_id=actor_discord_user_id,
+                actor_display=actor_display_name[:128],
+                action="player_issue_reported",
+                target=f"campaign:{campaign.id}",
+                audit_metadata={
+                    "campaign_id": campaign.id,
+                    "thread_id": campaign.discord_thread_id,
+                    "mode": campaign.mode,
+                    "issue_text": issue_text[:4000],
+                    "actor_character_name": actor_character_name or "",
+                    "actor_character_snapshot": actor_snapshot or {},
+                    "recent_turns": recent_payload,
+                },
+                created_at=datetime.utcnow(),
+            )
+            db.add(audit_row)
+            db.commit()
+            return True, f"Issue report logged (id={audit_row.id})."
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return False, f"Failed to report issue: {exc}"
+
     def audit_admin_action(
         self,
         db: Session,
@@ -2611,6 +3055,12 @@ class GameService:
                 pass
 
     def set_rule(self, db: Session, campaign: Campaign, key: str, value: str) -> None:
+        if settings.gameplay_use_db_api:
+            try:
+                self.db_api.set_campaign_rule(int(campaign.id), key, value)
+                return
+            except Exception:
+                pass
         row = (
             db.query(CampaignRule)
             .filter(CampaignRule.campaign_id == campaign.id, CampaignRule.rule_key == key)
@@ -3102,7 +3552,7 @@ class GameService:
         db.commit()
         return True
 
-    def sync_inventory_for_player(self, db: Session, player: Player, state: WorldState) -> None:
+    def sync_inventory_for_player(self, db: Session, player: Player, state: WorldState, *, auto_commit: bool = True) -> None:
         char_name = self.player_character_name(db, campaign_id=player.campaign_id, player_id=player.id)
         if not char_name:
             return
@@ -3127,9 +3577,12 @@ class GameService:
             if item_key not in state_keys:
                 db.delete(row)
 
-        db.commit()
+        if auto_commit:
+            db.commit()
 
-    def sync_character_row(self, db: Session, campaign: Campaign, player: Player, state: WorldState) -> None:
+    def sync_character_row(
+        self, db: Session, campaign: Campaign, player: Player, state: WorldState, *, auto_commit: bool = True
+    ) -> None:
         char_name = self.player_character_name(db, campaign_id=campaign.id, player_id=player.id)
         if not char_name or char_name not in state.party:
             return
@@ -3150,7 +3603,8 @@ class GameService:
         row.item_states = char_state.item_states
         row.effects = [e.model_dump() for e in char_state.effects]
         db.add(row)
-        db.commit()
+        if auto_commit:
+            db.commit()
 
     def apply_manual_commands(
         self,
@@ -3178,14 +3632,14 @@ class GameService:
             .one_or_none()
         )
         if player:
-            self.sync_inventory_for_player(db, player, updated)
-            self.sync_character_row(db, campaign, player, updated)
+            self.sync_inventory_for_player(db, player, updated, auto_commit=False)
+            self.sync_character_row(db, campaign, player, updated, auto_commit=False)
 
         turn = TurnLog(
             campaign_id=campaign.id,
             actor=actor,
             user_input=user_input,
-            ai_raw_output=json.dumps(
+            ai_raw_output=self.serialize_ai_raw_output(
                 {"source": "manual_command", "state_before": state_before, "state_after": state_after}
             ),
             accepted_commands=[c.model_dump() for c in validation["accepted"]],
@@ -3199,10 +3653,7 @@ class GameService:
 
     @staticmethod
     def _extract_state_before_from_turn(turn: TurnLog) -> dict | None:
-        try:
-            payload = json.loads(turn.ai_raw_output)
-        except json.JSONDecodeError:
-            return None
+        payload = GameService.deserialize_ai_raw_output(turn.ai_raw_output)
         state_before = payload.get("state_before")
         return state_before if isinstance(state_before, dict) else None
 
@@ -3345,7 +3796,7 @@ class GameService:
                 campaign_id=campaign.id,
                 actor=actor,
                 user_input=f"!teach {normalized_kind}|{normalized_key}|{note}",
-                ai_raw_output=json.dumps(
+                ai_raw_output=self.serialize_ai_raw_output(
                     {
                         "source": "teach_command",
                         "kind": normalized_kind,
@@ -3371,14 +3822,44 @@ class GameService:
         actor: str,
         actor_display_name: str,
         user_input: str,
+        correlation_id: str | None = None,
     ) -> tuple[str, dict]:
+        turn_correlation_id = (correlation_id or "").strip() or self._new_turn_correlation_id()
         player = self.ensure_player(db, campaign, actor, actor_display_name)
         auto_character_name, auto_created_default_character = self.ensure_default_character_for_player(db, campaign, player)
         actor_char_name = self.player_character_name(db, campaign_id=campaign.id, player_id=player.id)
         normalized_user_input = self._normalize_quoted_player_input(user_input, actor_display_name)
         current_state = WorldState.model_validate(campaign.state)
         state_before = current_state.model_dump()
+        self_view = self._self_inspection_narration(current_state, actor_char_name, normalized_user_input)
+        if self_view:
+            turn = TurnLog(
+                campaign_id=campaign.id,
+                actor=actor,
+                user_input=user_input,
+                ai_raw_output=self.serialize_ai_raw_output(
+                    {
+                        "source": "deterministic_self_query",
+                        "correlation_id": turn_correlation_id,
+                        "actor_character_name": actor_char_name,
+                        "normalized_user_input": normalized_user_input,
+                    }
+                ),
+                accepted_commands=[],
+                rejected_commands=[],
+                narration=self_view,
+            )
+            db.add(turn)
+            db.commit()
+            return self_view, {
+                "accepted": [],
+                "rejected": [],
+                "context": {"correlation_id": turn_correlation_id},
+                "auto_created_default_character": auto_created_default_character,
+                "auto_character_name": auto_character_name,
+            }
         context_window = self.context_builder.build(db, campaign, actor_id=actor)
+        context_window["correlation_id"] = turn_correlation_id
         system_prompt = self.build_campaign_system_prompt(db, campaign)
         system_prompt = self._augment_system_prompt_with_actor(system_prompt, actor_char_name)
         context_window["actor_inventory"] = self._actor_inventory_for_context(db, campaign, actor, current_state)
@@ -3402,16 +3883,17 @@ class GameService:
             new_state = apply_commands(current_state, accepted_cmds)
             new_state = tick_effects(new_state)
             campaign.state = new_state.model_dump()
-            self.sync_inventory_for_player(db, player, new_state)
-            self.sync_character_row(db, campaign, player, new_state)
+            self.sync_inventory_for_player(db, player, new_state, auto_commit=False)
+            self.sync_character_row(db, campaign, player, new_state, auto_commit=False)
 
             turn = TurnLog(
                 campaign_id=campaign.id,
                 actor=actor,
                 user_input=user_input,
-                ai_raw_output=json.dumps(
+                ai_raw_output=self.serialize_ai_raw_output(
                     {
                         "source": "intent_inventory_resolver",
+                        "correlation_id": turn_correlation_id,
                         "intent": intent.model_dump(),
                         "state_before": state_before,
                         "state_after": new_state.model_dump(),
@@ -3437,7 +3919,7 @@ class GameService:
             return inventory_resolution["narration"], {
                 "accepted": [c.model_dump() for c in accepted_cmds],
                 "rejected": [],
-                "context": {},
+                "context": {"correlation_id": turn_correlation_id},
                 "auto_created_default_character": auto_created_default_character,
                 "auto_character_name": auto_character_name,
             }
@@ -3494,16 +3976,17 @@ class GameService:
         )
 
         campaign.state = new_state.model_dump()
-        self.sync_inventory_for_player(db, player, new_state)
-        self.sync_character_row(db, campaign, player, new_state)
+        self.sync_inventory_for_player(db, player, new_state, auto_commit=False)
+        self.sync_character_row(db, campaign, player, new_state, auto_commit=False)
 
         turn = TurnLog(
             campaign_id=campaign.id,
             actor=actor,
             user_input=user_input,
-            ai_raw_output=json.dumps(
+            ai_raw_output=self.serialize_ai_raw_output(
                 {
                     "source": "llm_turn",
+                    "correlation_id": turn_correlation_id,
                     "intent": intent.model_dump(),
                     "intent_validation": {
                         "accepted": [c.model_dump() for c in intent_validation["accepted"]],
@@ -3543,6 +4026,7 @@ class GameService:
             ],
             "rejected": rejected,
             "context": context_window,
+            "correlation_id": turn_correlation_id,
             "auto_created_default_character": auto_created_default_character,
             "auto_character_name": auto_character_name,
         }
@@ -3663,14 +4147,45 @@ class GameService:
         actor_display_name: str,
         user_input: str,
         crew_definition_json: str | None = None,
+        correlation_id: str | None = None,
     ) -> tuple[str, dict]:
+        turn_correlation_id = (correlation_id or "").strip() or self._new_turn_correlation_id()
         player = self.ensure_player(db, campaign, actor, actor_display_name)
         auto_character_name, auto_created_default_character = self.ensure_default_character_for_player(db, campaign, player)
         actor_char_name = self.player_character_name(db, campaign_id=campaign.id, player_id=player.id)
         normalized_user_input = self._normalize_quoted_player_input(user_input, actor_display_name)
         current_state = WorldState.model_validate(campaign.state)
         state_before = current_state.model_dump()
+        self_view = self._self_inspection_narration(current_state, actor_char_name, normalized_user_input)
+        if self_view:
+            turn = TurnLog(
+                campaign_id=campaign.id,
+                actor=actor,
+                user_input=user_input,
+                ai_raw_output=self.serialize_ai_raw_output(
+                    {
+                        "source": "deterministic_self_query",
+                        "correlation_id": turn_correlation_id,
+                        "actor_character_name": actor_char_name,
+                        "normalized_user_input": normalized_user_input,
+                    }
+                ),
+                accepted_commands=[],
+                rejected_commands=[],
+                narration=self_view,
+            )
+            db.add(turn)
+            db.commit()
+            return self_view, {
+                "accepted": [],
+                "rejected": [],
+                "context": {"correlation_id": turn_correlation_id},
+                "auto_created_default_character": auto_created_default_character,
+                "auto_character_name": auto_character_name,
+                "crew_outputs": {},
+            }
         context_window = self.context_builder.build(db, campaign, actor_id=actor)
+        context_window["correlation_id"] = turn_correlation_id
         context_window["actor_inventory"] = self._actor_inventory_for_context(db, campaign, actor, current_state)
         context_window["actor_character_name"] = actor_char_name
         context_window["conversation_history"] = self._full_conversation_for_context(db, campaign)
@@ -3694,16 +4209,17 @@ class GameService:
             new_state = apply_commands(current_state, accepted_cmds)
             new_state = tick_effects(new_state)
             campaign.state = new_state.model_dump()
-            self.sync_inventory_for_player(db, player, new_state)
-            self.sync_character_row(db, campaign, player, new_state)
+            self.sync_inventory_for_player(db, player, new_state, auto_commit=False)
+            self.sync_character_row(db, campaign, player, new_state, auto_commit=False)
 
             turn = TurnLog(
                 campaign_id=campaign.id,
                 actor=actor,
                 user_input=user_input,
-                ai_raw_output=json.dumps(
+                ai_raw_output=self.serialize_ai_raw_output(
                     {
                         "source": "intent_inventory_resolver",
+                        "correlation_id": turn_correlation_id,
                         "intent": intent.model_dump(),
                         "state_before": state_before,
                         "state_after": new_state.model_dump(),
@@ -3729,7 +4245,7 @@ class GameService:
             return inventory_resolution["narration"], {
                 "accepted": [c.model_dump() for c in accepted_cmds],
                 "rejected": [],
-                "context": {},
+                "context": {"correlation_id": turn_correlation_id},
                 "crew_outputs": {},
                 "auto_created_default_character": auto_created_default_character,
                 "auto_character_name": auto_character_name,
@@ -3788,16 +4304,17 @@ class GameService:
         )
 
         campaign.state = new_state.model_dump()
-        self.sync_inventory_for_player(db, player, new_state)
-        self.sync_character_row(db, campaign, player, new_state)
+        self.sync_inventory_for_player(db, player, new_state, auto_commit=False)
+        self.sync_character_row(db, campaign, player, new_state, auto_commit=False)
 
         turn = TurnLog(
             campaign_id=campaign.id,
             actor=actor,
             user_input=user_input,
-            ai_raw_output=json.dumps(
+            ai_raw_output=self.serialize_ai_raw_output(
                 {
                     "source": "crew_turn",
+                    "correlation_id": turn_correlation_id,
                     "intent": intent.model_dump(),
                     "intent_validation": {
                         "accepted": [c.model_dump() for c in intent_validation["accepted"]],
@@ -3839,6 +4356,7 @@ class GameService:
             "rejected": rejected,
             "context": context_window,
             "crew_outputs": crew_outputs,
+            "correlation_id": turn_correlation_id,
             "auto_created_default_character": auto_created_default_character,
             "auto_character_name": auto_character_name,
         }
@@ -3851,22 +4369,66 @@ class GameService:
         actor_display_name: str,
         user_input: str,
     ) -> tuple[str, dict]:
-        rules = self.list_rules(db, campaign)
-        if self.turn_engine_for_campaign(db, campaign) == "crew":
-            return self.process_turn_with_crew(
+        turn_correlation_id = self._new_turn_correlation_id()
+        try:
+            rules = self.list_rules(db, campaign)
+            if self.turn_engine_for_campaign(db, campaign) == "crew":
+                return self.process_turn_with_crew(
+                    db,
+                    campaign=campaign,
+                    actor=actor,
+                    actor_display_name=actor_display_name,
+                    user_input=user_input,
+                    crew_definition_json=rules.get("agent_crew_definition"),
+                    correlation_id=turn_correlation_id,
+                )
+            return self.process_turn(
                 db,
                 campaign=campaign,
                 actor=actor,
                 actor_display_name=actor_display_name,
                 user_input=user_input,
-                crew_definition_json=rules.get("agent_crew_definition"),
+                correlation_id=turn_correlation_id,
             )
-        return self.process_turn(
-            db,
-            campaign=campaign,
-            actor=actor,
-            actor_display_name=actor_display_name,
-            user_input=user_input,
-        )
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            rollback_payload = {
+                "schema_version": 1,
+                "source": "turn_rollback",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "traceback": traceback.format_exc(limit=15),
+                "correlation_id": turn_correlation_id,
+                "actor": actor,
+                "user_input": user_input,
+            }
+            narration = "Turn failed and was rolled back safely. Please retry your action."
+            try:
+                db.add(
+                    TurnLog(
+                        campaign_id=campaign.id,
+                        actor=actor,
+                        user_input=user_input,
+                        ai_raw_output=self.serialize_ai_raw_output(rollback_payload),
+                        accepted_commands=[],
+                        rejected_commands=[{"reason": "turn_rolled_back", "error": str(exc)}],
+                        narration=narration,
+                    )
+                )
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
+            return narration, {
+                "accepted": [],
+                "rejected": [{"reason": "turn_rolled_back", "error": str(exc)}],
+                "context": {"rollback_envelope": rollback_payload, "correlation_id": turn_correlation_id},
+            }
+
 
 

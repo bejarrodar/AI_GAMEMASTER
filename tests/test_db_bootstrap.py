@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text
 
 from aigm.db import bootstrap
 from aigm.db.base import Base
@@ -47,3 +47,38 @@ def test_ensure_schema_raises_when_missing_and_auto_init_disabled(monkeypatch) -
             bootstrap.ensure_schema(required_tables=("campaigns",))
     finally:
         monkeypatch.setattr(bootstrap.settings, "database_auto_init", True)
+
+
+def test_ensure_schema_adds_missing_campaign_version_column(monkeypatch) -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                CREATE TABLE campaigns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    discord_thread_id VARCHAR(64) NOT NULL,
+                    mode VARCHAR(32) NOT NULL,
+                    state JSON NOT NULL,
+                    created_at DATETIME,
+                    updated_at DATETIME
+                )
+                """
+            )
+        )
+        conn.execute(text("CREATE TABLE system_logs (id INTEGER PRIMARY KEY AUTOINCREMENT)"))
+        conn.execute(text("CREATE TABLE bot_configs (id INTEGER PRIMARY KEY AUTOINCREMENT)"))
+
+    monkeypatch.setattr(bootstrap, "engine", engine)
+    called = {"value": False}
+
+    def _fake_init_db() -> None:
+        called["value"] = True
+
+    monkeypatch.setattr(bootstrap, "init_db", _fake_init_db)
+    changed = bootstrap.ensure_schema(required_tables=("campaigns", "system_logs", "bot_configs"))
+    assert changed is True
+    assert called["value"] is False
+    inspector = inspect(engine)
+    cols = {c["name"] for c in inspector.get_columns("campaigns")}
+    assert "version" in cols

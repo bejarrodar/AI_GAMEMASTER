@@ -93,6 +93,14 @@ class IntentFeasibilityCheck(BaseModel):
     reason: str = ""
     object_type: str = "unknown"
     portability: Literal["portable", "non_portable", "unknown"] = "unknown"
+    requires_payment: bool | None = None
+    cost_amount: int | None = Field(default=None, ge=0)
+    currency: str | None = None
+    payer_owner: Literal["self", "target", "scene", "unknown"] | None = None
+    has_required_funds: bool | None = None
+    acquisition_mode: Literal["pickup", "purchase", "steal", "loot", "gift", "craft", "unknown"] | None = None
+    would_be_theft: bool | None = None
+    location_context: str | None = None
 
 
 class IntentRelevanceSignal(BaseModel):

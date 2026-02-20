@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from sqlalchemy import inspect
+from sqlalchemy import inspect, text
 
 from aigm.config import settings
 from aigm.db.init_db import init_db
@@ -21,6 +21,36 @@ DEFAULT_REQUIRED_TABLES = (
     "dice_roll_logs",
 )
 
+REQUIRED_COLUMNS: dict[str, dict[str, str]] = {
+    "campaigns": {
+        # Optimistic locking column; required by Campaign.__mapper_args__["version_id_col"].
+        "version": "INTEGER NOT NULL DEFAULT 1",
+    }
+}
+
+
+def ensure_required_columns() -> bool:
+    """Ensure required columns exist on already-created tables.
+
+    This is primarily used to self-heal local SQLite databases that were created
+    before newer columns (e.g., `campaigns.version`) were introduced.
+    """
+    inspector = inspect(engine)
+    changed = False
+    with engine.begin() as conn:
+        for table_name, cols in REQUIRED_COLUMNS.items():
+            if not inspector.has_table(table_name):
+                continue
+            existing = {col["name"] for col in inspector.get_columns(table_name)}
+            for col_name, ddl in cols.items():
+                if col_name in existing:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {col_name} {ddl}"))
+                changed = True
+                if table_name == "campaigns" and col_name == "version":
+                    conn.execute(text("UPDATE campaigns SET version = 1 WHERE version IS NULL"))
+    return changed
+
 
 def ensure_schema(required_tables: tuple[str, ...] = DEFAULT_REQUIRED_TABLES) -> bool:
     """Ensure DB schema exists for required tables.
@@ -36,15 +66,21 @@ def ensure_schema(required_tables: tuple[str, ...] = DEFAULT_REQUIRED_TABLES) ->
 
     inspector = inspect(engine)
     missing = [name for name in required_tables if not inspector.has_table(name)]
-    if not missing:
-        return False
-    if not settings.database_auto_init:
-        raise RuntimeError(
-            "Database schema is missing required tables and AIGM_DATABASE_AUTO_INIT is false. "
-            "Run Alembic migrations or enable auto-init for this environment."
-        )
-    init_db()
-    return True
+    changed = False
+    if missing:
+        if not settings.database_auto_init:
+            raise RuntimeError(
+                "Database schema is missing required tables and AIGM_DATABASE_AUTO_INIT is false. "
+                "Run Alembic migrations or enable auto-init for this environment."
+            )
+        init_db()
+        changed = True
+
+    # Even when all required tables exist, columns may be stale in legacy DB files.
+    if ensure_required_columns():
+        changed = True
+
+    return changed
 
 
 def main() -> int:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from difflib import get_close_matches
 from urllib import error, request
@@ -28,6 +29,39 @@ class LLMAdapter:
     VALID_INTENT_ACTIONS = {"use", "add", "remove", "steal", "pickup", "other"}
     VALID_OWNERS = {"self", "target", "scene", "unknown"}
     VALID_PORTABILITY = {"portable", "non_portable", "unknown"}
+    _circuit_lock = threading.Lock()
+    _circuit_state: dict[str, dict[str, float | int]] = {
+        "ollama": {"failures": 0, "opened_until": 0.0},
+        "openai": {"failures": 0, "opened_until": 0.0},
+    }
+
+    @classmethod
+    def _circuit_is_open(cls, provider: str) -> bool:
+        p = provider.strip().lower()
+        with cls._circuit_lock:
+            state = cls._circuit_state.get(p, {"opened_until": 0.0})
+            return float(state.get("opened_until", 0.0) or 0.0) > time.time()
+
+    @classmethod
+    def _record_provider_success(cls, provider: str) -> None:
+        p = provider.strip().lower()
+        with cls._circuit_lock:
+            cls._circuit_state[p] = {"failures": 0, "opened_until": 0.0}
+
+    @classmethod
+    def _record_provider_failure(cls, provider: str) -> None:
+        p = provider.strip().lower()
+        threshold = max(1, int(settings.llm_circuit_breaker_failure_threshold))
+        reset_s = max(1, int(settings.llm_circuit_breaker_reset_s))
+        now = time.time()
+        with cls._circuit_lock:
+            state = cls._circuit_state.setdefault(p, {"failures": 0, "opened_until": 0.0})
+            failures = int(state.get("failures", 0) or 0) + 1
+            opened_until = float(state.get("opened_until", 0.0) or 0.0)
+            if failures >= threshold:
+                opened_until = now + float(reset_s)
+                failures = 0
+            cls._circuit_state[p] = {"failures": failures, "opened_until": opened_until}
 
     @staticmethod
     def _urlopen_json_with_retry(req: request.Request, timeout_s: int | float) -> dict:
@@ -201,6 +235,19 @@ class LLMAdapter:
 
     @classmethod
     def _extract_character_name(cls, description: str) -> str | None:
+        # Handle stylized spell-out patterns like "It's O-S-C-A-R ... It's M-A-Y-E-R."
+        spelled = re.findall(r"\bit[’']?s\s+([A-Za-z](?:-[A-Za-z]){2,})\b", description, flags=re.IGNORECASE)
+        if len(spelled) >= 2:
+            first = spelled[0].replace("-", "").strip()
+            second = spelled[1].replace("-", "").strip()
+            combined = cls._normalize_candidate_name(f"{first} {second}")
+            if combined:
+                return combined
+        if len(spelled) == 1:
+            single = cls._normalize_candidate_name(spelled[0].replace("-", ""))
+            if single:
+                return single
+
         patterns = [
             r"\bmy\s+name\s+is\s+([A-Za-z][A-Za-z\-']+(?:\s+[A-Za-z][A-Za-z\-']+)?)\b",
             r"\bname\s*[:=]\s*([A-Za-z][A-Za-z\-']+(?:\s+[A-Za-z][A-Za-z\-']+)?)\b",
@@ -220,6 +267,176 @@ class LLMAdapter:
             if candidate:
                 return candidate
         return None
+
+    @classmethod
+    def _default_starter_inventory(cls, description: str) -> dict[str, int]:
+        lower_desc = description.lower()
+        if any(k in lower_desc for k in ("mage", "wizard", "sorcer", "warlock")):
+            return {"arcane_focus": 1, "spellbook": 1, "travel_cloak": 1}
+        if any(k in lower_desc for k in ("druid", "ranger")):
+            return {"wooden_staff": 1, "herb_pouch": 1, "traveler_pack": 1}
+        if any(k in lower_desc for k in ("rogue", "thief", "assassin")):
+            return {"dagger": 1, "lockpick_set": 1, "dark_cloak": 1}
+        if any(k in lower_desc for k in ("fighter", "knight", "barbarian", "burly")):
+            return {"weapon": 1, "shield": 1, "rations": 1}
+        return {"bedroll": 1, "waterskin": 1, "rations": 1}
+
+    @classmethod
+    def _coerce_character_profile(cls, parsed: dict, description: str, fallback_name: str) -> CharacterState:
+        inferred_name = str(parsed.get("name", "") or "").strip()
+        parsed_name = cls._extract_character_name(description)
+        name = inferred_name or parsed_name or fallback_name
+
+        hp_raw = parsed.get("hp", 10)
+        try:
+            hp = int(hp_raw)
+        except (TypeError, ValueError):
+            hp = 10
+        hp = max(1, min(30, hp))
+
+        stats_raw = parsed.get("stats", {}) if isinstance(parsed.get("stats"), dict) else {}
+        stats: dict[str, int] = {}
+        for key in ("str", "dex", "int"):
+            value = stats_raw.get(key, 10)
+            try:
+                stats[key] = max(3, min(20, int(value)))
+            except (TypeError, ValueError):
+                stats[key] = 10
+
+        # Preserve exact user-provided description as canonical character text.
+        desc = description.strip()
+
+        inventory: dict[str, int] = {}
+        inv_raw = parsed.get("inventory", [])
+        if isinstance(inv_raw, dict):
+            for item_key, qty in inv_raw.items():
+                key = re.sub(r"\s+", "_", str(item_key or "").strip().lower())
+                if not key:
+                    continue
+                try:
+                    quantity = int(qty)
+                except (TypeError, ValueError):
+                    quantity = 1
+                if quantity > 0:
+                    inventory[key] = quantity
+        elif isinstance(inv_raw, list):
+            for row in inv_raw:
+                if not isinstance(row, dict):
+                    continue
+                key = re.sub(r"\s+", "_", str(row.get("item_key", "") or "").strip().lower())
+                if not key:
+                    continue
+                try:
+                    quantity = int(row.get("quantity", 1))
+                except (TypeError, ValueError):
+                    quantity = 1
+                if quantity > 0:
+                    inventory[key] = inventory.get(key, 0) + quantity
+
+        if not inventory:
+            inventory = cls._default_starter_inventory(description)
+        elif "stick" in description.lower() and "stick" not in inventory:
+            inventory["stick"] = 1
+
+        effects = []
+        effects_raw = parsed.get("effects", []) if isinstance(parsed.get("effects"), list) else []
+        for row in effects_raw:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("key", "") or "").strip().lower().replace(" ", "_")
+            if not key:
+                continue
+            category = str(row.get("category", "misc") or "misc").strip().lower()
+            if category not in {"magical", "physical", "misc"}:
+                category = "misc"
+            description_text = str(row.get("description", "") or "").strip()
+            duration = row.get("duration_turns")
+            try:
+                duration_int = None if duration in {None, ""} else int(duration)
+            except (TypeError, ValueError):
+                duration_int = None
+            if duration_int is not None and duration_int < 1:
+                duration_int = None
+            effects.append(
+                {
+                    "key": key,
+                    "category": category,
+                    "description": description_text,
+                    "duration_turns": duration_int,
+                }
+            )
+
+        return CharacterState.model_validate(
+            {
+                "name": name,
+                "description": desc,
+                "hp": hp,
+                "max_hp": hp,
+                "stats": stats,
+                "inventory": inventory,
+                "item_states": {},
+                "effects": effects,
+            }
+        )
+
+    def _character_profile_with_ollama(self, description: str, fallback_name: str) -> CharacterState:
+        json_shape = (
+            "Return JSON only with this shape: "
+            '{"name":"string","description":"string","hp":10,"stats":{"str":10,"dex":10,"int":10},'
+            '"inventory":[{"item_key":"string","quantity":1}],"effects":[{"key":"string","category":"magical|physical|misc",'
+            '"description":"string","duration_turns":null}]}.'
+        )
+        prompt = (
+            f"{json_shape}\n"
+            "Extract a player character profile from the description.\n"
+            "Use English. Infer the intended character name if present.\n"
+            "If explicit starting gear is not provided, generate 2-4 starter equipment items that fit the described archetype.\n"
+            f"fallback_name={fallback_name}\n"
+            f"description={description}"
+        )
+        payload = {
+            "model": self._model_for_task("intent"),
+            "messages": [
+                {"role": "system", "content": "You extract structured RPG character data."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": self._options_for_task("intent"),
+        }
+        if settings.llm_json_mode_strict:
+            payload["format"] = "json"
+        req = request.Request(
+            url=f"{settings.ollama_url.rstrip('/')}/api/chat",
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        body = self._urlopen_json_with_retry(req, timeout_s=settings.ollama_timeout_s)
+        content = body.get("message", {}).get("content", "")
+        parsed = self._extract_json_object(content) if content else {}
+        return self._coerce_character_profile(parsed, description, fallback_name)
+
+    def _character_profile_with_openai(self, description: str, fallback_name: str) -> CharacterState:
+        json_shape = (
+            "Return JSON only with this shape: "
+            '{"name":"string","description":"string","hp":10,"stats":{"str":10,"dex":10,"int":10},'
+            '"inventory":[{"item_key":"string","quantity":1}],"effects":[{"key":"string","category":"magical|physical|misc",'
+            '"description":"string","duration_turns":null}]}.'
+        )
+        prompt = (
+            f"{json_shape}\n"
+            "Extract a player character profile from the description.\n"
+            "Use English. Infer the intended character name if present.\n"
+            "If explicit starting gear is not provided, generate 2-4 starter equipment items that fit the described archetype.\n"
+            f"fallback_name={fallback_name}\n"
+            f"description={description}"
+        )
+        parsed = self._chat_json_with_openai(
+            task="intent",
+            system_prompt="You extract structured RPG character data.",
+            user_prompt=prompt,
+        )
+        return self._coerce_character_profile(parsed, description, fallback_name)
 
     @staticmethod
     def _fallback_narration(user_input: str, state_json: str, mode: str) -> str:
@@ -438,6 +655,44 @@ class LLMAdapter:
                     "reason": reason,
                     "object_type": object_type,
                     "portability": portability,
+                    "requires_payment": (
+                        row.get("requires_payment")
+                        if isinstance(row.get("requires_payment"), bool) or row.get("requires_payment") is None
+                        else str(row.get("requires_payment", "")).strip().lower() in {"1", "true", "yes", "y"}
+                    ),
+                    "cost_amount": (
+                        int(row.get("cost_amount"))
+                        if row.get("cost_amount") not in (None, "", "null")
+                        and str(row.get("cost_amount", "")).strip().lstrip("-").isdigit()
+                        else None
+                    ),
+                    "currency": (
+                        str(row.get("currency", "")).strip().lower() if str(row.get("currency", "")).strip() else None
+                    ),
+                    "payer_owner": (
+                        str(row.get("payer_owner", "")).strip().lower()
+                        if str(row.get("payer_owner", "")).strip().lower() in cls.VALID_OWNERS
+                        else None
+                    ),
+                    "has_required_funds": (
+                        row.get("has_required_funds")
+                        if isinstance(row.get("has_required_funds"), bool) or row.get("has_required_funds") is None
+                        else str(row.get("has_required_funds", "")).strip().lower() in {"1", "true", "yes", "y"}
+                    ),
+                    "acquisition_mode": (
+                        str(row.get("acquisition_mode", "")).strip().lower()
+                        if str(row.get("acquisition_mode", "")).strip().lower()
+                        in {"pickup", "purchase", "steal", "loot", "gift", "craft", "unknown"}
+                        else None
+                    ),
+                    "would_be_theft": (
+                        row.get("would_be_theft")
+                        if isinstance(row.get("would_be_theft"), bool) or row.get("would_be_theft") is None
+                        else str(row.get("would_be_theft", "")).strip().lower() in {"1", "true", "yes", "y"}
+                    ),
+                    "location_context": (
+                        str(row.get("location_context", "")).strip() if str(row.get("location_context", "")).strip() else None
+                    ),
                 }
             )
 
@@ -559,15 +814,25 @@ class LLMAdapter:
     def generate(self, user_input: str, state_json: str, mode: str, context_json: str, system_prompt: str) -> AIResponse:
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._fallback_response(user_input, state_json, mode)
             try:
-                return self._generate_with_ollama(user_input, state_json, mode, context_json, system_prompt)
+                out = self._generate_with_ollama(user_input, state_json, mode, context_json, system_prompt)
+                self._record_provider_success("ollama")
+                return out
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
                 print(f"[LLMAdapter] Ollama failed, using fallback: {type(exc).__name__}: {exc}")
                 return self._fallback_response(user_input, state_json, mode)
         if provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._fallback_response(user_input, state_json, mode)
             try:
-                return self._generate_with_openai(user_input, state_json, mode, context_json, system_prompt)
+                out = self._generate_with_openai(user_input, state_json, mode, context_json, system_prompt)
+                self._record_provider_success("openai")
+                return out
             except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
                 print(f"[LLMAdapter] OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
                 return self._fallback_response(user_input, state_json, mode)
         _ = (state_json, mode, context_json, system_prompt)
@@ -680,26 +945,16 @@ class LLMAdapter:
                 }
             )
             commands.append({"type": "add_item", "key": item_key, "amount": 1, "target": None})
-            scene_text = ""
-            try:
-                scene_text = str(json.loads(state_json).get("scene", ""))
-            except json.JSONDecodeError:
-                scene_text = ""
-            plausible = bool(
-                scene_text and any(x in scene_text.lower() for x in ("forest", "woods", "trail", "town", "ruins", "market"))
-            )
-            object_type, portability = cls._classify_object(item_key)
-            is_possible = plausible and portability != "non_portable"
             feasibility_checks.append(
                 {
                     "action": "pickup",
                     "item_key": item_key,
                     "target_character": None,
                     "question": f"Can the player find '{item_key}' in the current scene?",
-                    "is_possible": is_possible,
-                    "reason": "Scene affordance heuristic from fallback extractor.",
-                    "object_type": object_type,
-                    "portability": portability,
+                    "is_possible": False,
+                    "reason": "Requires explicit feasibility assessment from model/context.",
+                    "object_type": "unknown",
+                    "portability": "unknown",
                 }
             )
 
@@ -734,7 +989,9 @@ class LLMAdapter:
         )
 
     @classmethod
-    def _enrich_intent_from_text(cls, user_input: str, extracted: PlayerIntentExtraction) -> PlayerIntentExtraction:
+    def _enrich_intent_from_text(
+        cls, user_input: str, extracted: PlayerIntentExtraction, *, emergency_fallback: bool = True
+    ) -> PlayerIntentExtraction:
         text = user_input.lower()
         inventory = list(extracted.inventory)
         commands = list(extracted.commands)
@@ -746,7 +1003,19 @@ class LLMAdapter:
                     return True
             return False
 
-        # Capture attempts like "put player Bear ... into inventory" even when model misses it.
+        # Only allow regex-based intent inference during emergency fallback when model extraction failed.
+        if not emergency_fallback:
+            return PlayerIntentExtraction.model_validate(
+                {
+                    "inventory": [row.model_dump() if hasattr(row, "model_dump") else row for row in inventory],
+                    "commands": [row.model_dump() if hasattr(row, "model_dump") else row for row in commands],
+                    "feasibility_checks": [
+                        row.model_dump() if hasattr(row, "model_dump") else row for row in feasibility_checks
+                    ],
+                }
+            )
+
+        # Capture attempts like "put player Bear ... into inventory" when model missed it.
         m = re.search(
             r"\b(?:put|place|shove|stuff|push)\s+(?:player\s+)?([a-z][a-z0-9_\-']*)\s+.*\b(?:into|inside)\b.+\binventory\b",
             text,
@@ -799,7 +1068,7 @@ class LLMAdapter:
                     {"action": "use", "item_key": item, "quantity": 1, "target_character": None, "owner": "self"}
                 )
 
-        # Ensure each inventory intent has feasibility + type/portability metadata.
+        # Ensure each inventory intent has feasibility + type/portability metadata in emergency mode.
         for row in inventory:
             action = row.action if hasattr(row, "action") else row.get("action", "other")
             item_key = row.item_key if hasattr(row, "item_key") else row.get("item_key", "")
@@ -814,7 +1083,7 @@ class LLMAdapter:
                 chk_action = chk.action if hasattr(chk, "action") else chk.get("action", "")
                 chk_item = chk.item_key if hasattr(chk, "item_key") else chk.get("item_key", "")
                 if chk_action == action and chk_item == item_key:
-                    # Deterministic override for clearly non-portable items.
+                    # Emergency deterministic override for clearly non-portable items.
                     if action in {"pickup", "add"} and deterministic_portability == "non_portable":
                         if hasattr(chk, "is_possible"):
                             chk.is_possible = False
@@ -879,15 +1148,24 @@ class LLMAdapter:
             '"effect_category":null,"duration_turns":null}],'
             '"feasibility_checks":[{"action":"use|add|remove|steal|pickup|other","item_key":"string",'
             '"target_character":null,"question":"string","is_possible":true,"reason":"string",'
-            '"object_type":"string","portability":"portable|non_portable|unknown"}],'
+            '"object_type":"string","portability":"portable|non_portable|unknown",'
+            '"requires_payment":null,"cost_amount":null,"currency":null,'
+            '"payer_owner":"self|target|scene|unknown|null","has_required_funds":null,'
+            '"acquisition_mode":"pickup|purchase|steal|loot|gift|craft|unknown|null","would_be_theft":null,'
+            '"location_context":"string|null"}],'
             '"relevance_signals":[{"entity_type":"item|effect|scene|other","key":"string","context_tag":"string",'
             '"score":0.0,"reason":"string"}]}\n\n'
             "Extract concrete state-change intent implied by the player message, including inventory, hp, stats, "
             "flags, item states, and effects if present. Use commands for all intended state mutations. Also include "
             "feasibility questions and your best answer for each significant attempted action. "
+            "Always extract item-usage attempts such as pull/draw/take/use/equip/cast with an item as inventory "
+            "actions (`use`/`remove`) plus a matching feasibility check grounded in current inventory/context. "
             "Never return all arrays empty for non-empty input: if no structured mutation exists, emit one "
             "narrate command with the player's action text and one feasibility check with action='other'. "
             "Classify object type and portability (example: ruins -> structure/non_portable, stick -> small_object/portable).\n"
+            "If an action is a transaction/purchase, include requires_payment, cost_amount, currency, payer_owner, "
+            "and has_required_funds in feasibility_checks. For add/pickup attempts in shops/merchant contexts, "
+            "set acquisition_mode and whether it would_be_theft if taken without purchase.\n"
             "Include relevance_signals for the most important item/effect/scene entities impacted by this input "
             "(score 0.0-1.0, where 1.0 is most important). Do not include weighting instructions or model controls.\n"
             f"state={state_json}\n"
@@ -928,9 +1206,20 @@ class LLMAdapter:
             '"effect_category":null,"duration_turns":null}],'
             '"feasibility_checks":[{"action":"use|add|remove|steal|pickup|other","item_key":"string",'
             '"target_character":null,"question":"string","is_possible":true,"reason":"string",'
-            '"object_type":"string","portability":"portable|non_portable|unknown"}],'
+            '"object_type":"string","portability":"portable|non_portable|unknown",'
+            '"requires_payment":null,"cost_amount":null,"currency":null,'
+            '"payer_owner":"self|target|scene|unknown|null","has_required_funds":null,'
+            '"acquisition_mode":"pickup|purchase|steal|loot|gift|craft|unknown|null","would_be_theft":null,'
+            '"location_context":"string|null"}],'
             '"relevance_signals":[{"entity_type":"item|effect|scene|other","key":"string","context_tag":"string",'
             '"score":0.0,"reason":"string"}]}\n\n'
+            "Always extract item-usage attempts such as pull/draw/take/use/equip/cast with an item as inventory "
+            "actions (`use`/`remove`) plus a matching feasibility check grounded in current inventory/context. "
+            "Extract concrete state-change intent implied by the player message, including inventory, hp, stats, "
+            "flags, item states, and effects if present. Use commands for all intended state mutations. "
+            "If an action is a transaction/purchase, include requires_payment, cost_amount, currency, payer_owner, "
+            "and has_required_funds in feasibility_checks. For add/pickup attempts in shops/merchant contexts, "
+            "set acquisition_mode and whether it would_be_theft if taken without purchase.\n"
             f"state={state_json}\n"
             f"context={context_json}\n"
             f"user_input={user_input}"
@@ -943,18 +1232,246 @@ class LLMAdapter:
     ) -> PlayerIntentExtraction:
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._enrich_intent_from_text(
+                    user_input,
+                    self._fallback_extract_player_intent(user_input, state_json),
+                    emergency_fallback=True,
+                )
             try:
                 raw = self._extract_player_intent_with_ollama(user_input, state_json, context_json, system_prompt)
-                return self._enrich_intent_from_text(user_input, raw)
+                self._record_provider_success("ollama")
+                return self._enrich_intent_from_text(user_input, raw, emergency_fallback=False)
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
                 print(f"[LLMAdapter] Intent extraction via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
         elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._enrich_intent_from_text(
+                    user_input,
+                    self._fallback_extract_player_intent(user_input, state_json),
+                    emergency_fallback=True,
+                )
             try:
                 raw = self._extract_player_intent_with_openai(user_input, state_json, context_json, system_prompt)
-                return self._enrich_intent_from_text(user_input, raw)
+                self._record_provider_success("openai")
+                return self._enrich_intent_from_text(user_input, raw, emergency_fallback=False)
             except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
                 print(f"[LLMAdapter] Intent extraction via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
-        return self._enrich_intent_from_text(user_input, self._fallback_extract_player_intent(user_input, state_json))
+        return self._enrich_intent_from_text(
+            user_input,
+            self._fallback_extract_player_intent(user_input, state_json),
+            emergency_fallback=True,
+        )
+
+    @classmethod
+    def _fallback_inventory_action_feasibility(cls, action: str, item_key: str, scene: str) -> dict:
+        object_type, portability = cls._classify_object(item_key)
+        if action in {"pickup", "add"} and portability == "non_portable":
+            return {
+                "is_possible": False,
+                "reason": f"'{item_key}' is a {object_type} and is not portable.",
+                "object_type": object_type,
+                "portability": portability,
+                "confidence": 0.95,
+            }
+        if action == "pickup" and not (scene or "").strip():
+            return {
+                "is_possible": False,
+                "reason": "Scene context is missing for pickup feasibility.",
+                "object_type": object_type,
+                "portability": portability,
+                "confidence": 0.6,
+            }
+        return {
+            "is_possible": True,
+            "reason": "No hard contradiction detected in fallback feasibility check.",
+            "object_type": object_type,
+            "portability": portability,
+            "confidence": 0.4,
+        }
+
+    def _inventory_action_feasibility_with_ollama(
+        self,
+        *,
+        action: str,
+        item_key: str,
+        scene: str,
+        user_input: str,
+        state_json: str,
+        context_json: str,
+    ) -> dict:
+        prompt = (
+            "Return JSON only with this shape: "
+            '{"is_possible":true,"reason":"string","object_type":"string","portability":"portable|non_portable|unknown",'
+            '"confidence":0.0,"requires_payment":null,"cost_amount":null,"currency":null,"would_be_theft":null,'
+            '"acquisition_mode":"pickup|purchase|steal|loot|gift|craft|unknown|null"}\n\n'
+            "Determine whether the requested inventory action is feasible right now given scene/state/context.\n"
+            f"action={action}\n"
+            f"item_key={item_key}\n"
+            f"scene={scene}\n"
+            f"user_input={user_input}\n"
+            f"state={state_json}\n"
+            f"context={context_json}"
+        )
+        payload = {
+            "model": self._model_for_task("intent"),
+            "messages": [
+                {"role": "system", "content": "You are a strict RPG feasibility checker."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": self._options_for_task("intent"),
+        }
+        if settings.llm_json_mode_strict:
+            payload["format"] = "json"
+        req = request.Request(
+            url=f"{settings.ollama_url.rstrip('/')}/api/chat",
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        body = self._urlopen_json_with_retry(req, timeout_s=settings.ollama_timeout_s)
+        parsed = self._extract_json_object(body.get("message", {}).get("content", "") or "{}")
+        fallback = self._fallback_inventory_action_feasibility(action, item_key, scene)
+        return {
+            "is_possible": bool(parsed.get("is_possible", fallback["is_possible"])),
+            "reason": str(parsed.get("reason", fallback["reason"]) or fallback["reason"]),
+            "object_type": str(parsed.get("object_type", fallback["object_type"]) or fallback["object_type"]),
+            "portability": str(parsed.get("portability", fallback["portability"]) or fallback["portability"]),
+            "confidence": float(parsed.get("confidence", fallback["confidence"]) or fallback["confidence"]),
+            "requires_payment": (
+                parsed.get("requires_payment")
+                if isinstance(parsed.get("requires_payment"), bool) or parsed.get("requires_payment") is None
+                else None
+            ),
+            "cost_amount": (
+                int(parsed.get("cost_amount"))
+                if parsed.get("cost_amount") not in (None, "", "null")
+                and str(parsed.get("cost_amount", "")).strip().lstrip("-").isdigit()
+                else None
+            ),
+            "currency": str(parsed.get("currency", "")).strip().lower() or None,
+            "would_be_theft": (
+                parsed.get("would_be_theft")
+                if isinstance(parsed.get("would_be_theft"), bool) or parsed.get("would_be_theft") is None
+                else None
+            ),
+            "acquisition_mode": (
+                str(parsed.get("acquisition_mode", "")).strip().lower()
+                if str(parsed.get("acquisition_mode", "")).strip().lower()
+                in {"pickup", "purchase", "steal", "loot", "gift", "craft", "unknown"}
+                else None
+            ),
+        }
+
+    def _inventory_action_feasibility_with_openai(
+        self,
+        *,
+        action: str,
+        item_key: str,
+        scene: str,
+        user_input: str,
+        state_json: str,
+        context_json: str,
+    ) -> dict:
+        prompt = (
+            "Return JSON only with this shape: "
+            '{"is_possible":true,"reason":"string","object_type":"string","portability":"portable|non_portable|unknown",'
+            '"confidence":0.0,"requires_payment":null,"cost_amount":null,"currency":null,"would_be_theft":null,'
+            '"acquisition_mode":"pickup|purchase|steal|loot|gift|craft|unknown|null"}\n\n'
+            "Determine whether the requested inventory action is feasible right now given scene/state/context.\n"
+            f"action={action}\n"
+            f"item_key={item_key}\n"
+            f"scene={scene}\n"
+            f"user_input={user_input}\n"
+            f"state={state_json}\n"
+            f"context={context_json}"
+        )
+        parsed = self._chat_json_with_openai(
+            task="intent",
+            system_prompt="You are a strict RPG feasibility checker.",
+            user_prompt=prompt,
+        )
+        fallback = self._fallback_inventory_action_feasibility(action, item_key, scene)
+        return {
+            "is_possible": bool(parsed.get("is_possible", fallback["is_possible"])),
+            "reason": str(parsed.get("reason", fallback["reason"]) or fallback["reason"]),
+            "object_type": str(parsed.get("object_type", fallback["object_type"]) or fallback["object_type"]),
+            "portability": str(parsed.get("portability", fallback["portability"]) or fallback["portability"]),
+            "confidence": float(parsed.get("confidence", fallback["confidence"]) or fallback["confidence"]),
+            "requires_payment": (
+                parsed.get("requires_payment")
+                if isinstance(parsed.get("requires_payment"), bool) or parsed.get("requires_payment") is None
+                else None
+            ),
+            "cost_amount": (
+                int(parsed.get("cost_amount"))
+                if parsed.get("cost_amount") not in (None, "", "null")
+                and str(parsed.get("cost_amount", "")).strip().lstrip("-").isdigit()
+                else None
+            ),
+            "currency": str(parsed.get("currency", "")).strip().lower() or None,
+            "would_be_theft": (
+                parsed.get("would_be_theft")
+                if isinstance(parsed.get("would_be_theft"), bool) or parsed.get("would_be_theft") is None
+                else None
+            ),
+            "acquisition_mode": (
+                str(parsed.get("acquisition_mode", "")).strip().lower()
+                if str(parsed.get("acquisition_mode", "")).strip().lower()
+                in {"pickup", "purchase", "steal", "loot", "gift", "craft", "unknown"}
+                else None
+            ),
+        }
+
+    def assess_inventory_action_feasibility(
+        self,
+        *,
+        action: str,
+        item_key: str,
+        scene: str,
+        user_input: str,
+        state_json: str,
+        context_json: str,
+    ) -> dict:
+        provider = settings.llm_provider.strip().lower()
+        if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._fallback_inventory_action_feasibility(action, item_key, scene)
+            try:
+                out = self._inventory_action_feasibility_with_ollama(
+                    action=action,
+                    item_key=item_key,
+                    scene=scene,
+                    user_input=user_input,
+                    state_json=state_json,
+                    context_json=context_json,
+                )
+                self._record_provider_success("ollama")
+                return out
+            except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
+                print(f"[LLMAdapter] Feasibility check via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
+        elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._fallback_inventory_action_feasibility(action, item_key, scene)
+            try:
+                out = self._inventory_action_feasibility_with_openai(
+                    action=action,
+                    item_key=item_key,
+                    scene=scene,
+                    user_input=user_input,
+                    state_json=state_json,
+                    context_json=context_json,
+                )
+                self._record_provider_success("openai")
+                return out
+            except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
+                print(f"[LLMAdapter] Feasibility check via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
+        return self._fallback_inventory_action_feasibility(action, item_key, scene)
 
     @staticmethod
     def _fallback_review_output(narration: str) -> OutputReview:
@@ -1052,14 +1569,24 @@ class LLMAdapter:
     ) -> OutputReview:
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._fallback_review_output(narration)
             try:
-                return self._review_output_with_ollama(user_input, narration, state_json, context_json, system_prompt)
+                out = self._review_output_with_ollama(user_input, narration, state_json, context_json, system_prompt)
+                self._record_provider_success("ollama")
+                return out
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
                 print(f"[LLMAdapter] Output review via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
         elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._fallback_review_output(narration)
             try:
-                return self._review_output_with_openai(user_input, narration, state_json, context_json, system_prompt)
+                out = self._review_output_with_openai(user_input, narration, state_json, context_json, system_prompt)
+                self._record_provider_success("openai")
+                return out
             except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
                 print(f"[LLMAdapter] Output review via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
         return self._fallback_review_output(narration)
 
@@ -1154,18 +1681,26 @@ class LLMAdapter:
     def infer_discord_command(self, user_input: str, possible_commands: list[str]) -> dict:
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._fallback_infer_discord_command(user_input, possible_commands)
             try:
                 guessed = self._infer_discord_command_with_ollama(user_input, possible_commands)
                 if guessed.get("matched_command"):
+                    self._record_provider_success("ollama")
                     return guessed
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
                 print(f"[LLMAdapter] Command inference via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
         elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._fallback_infer_discord_command(user_input, possible_commands)
             try:
                 guessed = self._infer_discord_command_with_openai(user_input, possible_commands)
                 if guessed.get("matched_command"):
+                    self._record_provider_success("openai")
                     return guessed
             except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
                 print(f"[LLMAdapter] Command inference via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
         return self._fallback_infer_discord_command(user_input, possible_commands)
 
@@ -1300,57 +1835,95 @@ class LLMAdapter:
             "npcs": dict(parsed.get("npcs", {}) or {}),
         }
 
+    @staticmethod
+    def _normalize_world_seed_entities(payload: dict) -> tuple[dict[str, dict], dict[str, dict]]:
+        raw_locations = dict(payload.get("locations", {}) or {})
+        raw_npcs = dict(payload.get("npcs", {}) or {})
+
+        locations: dict[str, dict] = {}
+        for key, value in raw_locations.items():
+            name = str(key).strip()
+            if not name:
+                continue
+            row = dict(value or {}) if isinstance(value, dict) else {}
+            row["name"] = str(row.get("name", "") or name)
+            row["description"] = str(row.get("description", "") or "")
+            tags = row.get("tags", [])
+            if not isinstance(tags, list):
+                tags = [str(tags)]
+            row["tags"] = [str(t).strip() for t in tags if str(t).strip()]
+            if "connected_to" in row and not isinstance(row.get("connected_to"), list):
+                row["connected_to"] = [str(row.get("connected_to"))]
+            locations[name] = row
+
+        npcs: dict[str, dict] = {}
+        for key, value in raw_npcs.items():
+            name = str(key).strip()
+            if not name:
+                continue
+            row = dict(value or {}) if isinstance(value, dict) else {}
+            row["name"] = str(row.get("name", "") or name)
+            row["description"] = str(row.get("description", "") or "")
+            row["disposition"] = str(row.get("disposition", "") or "neutral")
+            row["location"] = str(row.get("location", "") or "")
+            npcs[name] = row
+
+        return locations, npcs
+
     def generate_world_seed(self, mode: str) -> WorldState:
         payload = self._fallback_world_seed_payload(mode)
         provider = settings.llm_provider.strip().lower()
         if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                locations, npcs = self._normalize_world_seed_entities(payload)
+                return WorldState(scene=payload["scene_short"], flags={"mode": mode, "scene_intro": payload["scene_intro"]}, party={}, npcs=npcs, locations=locations, combat_round=None)
             try:
                 payload = self._generate_world_seed_with_ollama(mode)
+                self._record_provider_success("ollama")
             except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
                 print(f"[LLMAdapter] World seed via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
         elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                locations, npcs = self._normalize_world_seed_entities(payload)
+                return WorldState(scene=payload["scene_short"], flags={"mode": mode, "scene_intro": payload["scene_intro"]}, party={}, npcs=npcs, locations=locations, combat_round=None)
             try:
                 payload = self._generate_world_seed_with_openai(mode)
+                self._record_provider_success("openai")
             except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
                 print(f"[LLMAdapter] World seed via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
+
+        locations, npcs = self._normalize_world_seed_entities(payload)
         return WorldState(
             scene=payload["scene_short"],
             flags={"mode": mode, "scene_intro": payload["scene_intro"]},
             party={},
-            npcs=dict(payload.get("npcs", {}) or {}),
-            locations=dict(payload.get("locations", {}) or {}),
+            npcs=npcs,
+            locations=locations,
             combat_round=None,
         )
 
     def generate_character_from_description(self, description: str, fallback_name: str) -> CharacterState:
-        lower_desc = description.lower()
-        hp = 12 if "tank" in lower_desc else 10
-        stats = {"str": 10, "dex": 10, "int": 10}
-        if "wizard" in lower_desc or "mage" in lower_desc or "druid" in lower_desc:
-            stats["int"] = 14
-        if "rogue" in lower_desc or "thief" in lower_desc:
-            stats["dex"] = 14
-        if "fighter" in lower_desc or "knight" in lower_desc:
-            stats["str"] = 14
-
-        parsed_name = self._extract_character_name(description)
-        name = parsed_name if parsed_name else fallback_name
-
-        inventory: dict[str, int] = {}
-        if "stick" in lower_desc:
-            inventory["stick"] = 1
-        elif "staff" in lower_desc:
-            inventory["staff"] = 1
-        elif "club" in lower_desc or "cudgel" in lower_desc:
-            inventory["club"] = 1
-
-        return CharacterState(
-            name=name,
-            description=description.strip(),
-            hp=hp,
-            max_hp=hp,
-            stats=stats,
-            inventory=inventory,
-            item_states={},
-            effects=[],
-        )
+        provider = settings.llm_provider.strip().lower()
+        if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._coerce_character_profile({}, description, fallback_name)
+            try:
+                out = self._character_profile_with_ollama(description, fallback_name)
+                self._record_provider_success("ollama")
+                return out
+            except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
+                print(f"[LLMAdapter] Character extraction via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
+        elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._coerce_character_profile({}, description, fallback_name)
+            try:
+                out = self._character_profile_with_openai(description, fallback_name)
+                self._record_provider_success("openai")
+                return out
+            except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
+                print(f"[LLMAdapter] Character extraction via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
+        return self._coerce_character_profile({}, description, fallback_name)

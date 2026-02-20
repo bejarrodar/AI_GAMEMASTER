@@ -31,8 +31,8 @@ This file documents all Discord commands implemented by the bot in `src/aigm/bot
   - Designed for private/admin-only threads and disaster recovery.
 
 - `!ping`
-  - Replies with `pong`.
-  - Use this to confirm bot responsiveness in a thread after game start.
+  - Replies with runtime status details (`mode`, `started`, `engine`, `thread`).
+  - Use this to confirm bot responsiveness and current campaign state in a thread.
 
 ## Campaign Rules
 
@@ -108,12 +108,10 @@ This file documents all Discord commands implemented by the bot in `src/aigm/bot
 - `!mycharacter <natural language character description>`
   - Generates and registers/updates the calling player's linked character in campaign state.
   - Ensures unique character name in party.
-  - Alias: `!mycharactor ...`
 
 - `!deletecharacter`
   - Deletes your linked player character from campaign state.
   - Clears your normalized inventory rows for this campaign.
-  - Alias: `!deletecharactor`
 
 ## Manual State Commands
 
@@ -161,3 +159,4 @@ This file documents all Discord commands implemented by the bot in `src/aigm/bot
 - All narrative turns run through validation/state application safeguards.
 - Invalid mutation commands are rejected before state is changed.
 - Some commands may return usage guidance on malformed input.
+- Unknown `!` commands are passed to LLM command inference to suggest the closest valid command when possible.

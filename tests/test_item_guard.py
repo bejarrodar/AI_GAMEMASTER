@@ -293,6 +293,86 @@ def test_runtime_constraints_reject_non_portable_tree_inventory_action() -> None
     assert any("non-portable" in c for c in constraints)
 
 
+def test_runtime_constraints_reject_shop_take_without_purchase() -> None:
+    svc = GameService(LLMAdapter())
+    state = WorldState(
+        scene="Inside a bustling magic shop with a wooden counter.",
+        party={"Bear": CharacterState(name="Bear", hp=10, max_hp=10, inventory={"gold_coins": 20})},
+    )
+    intent = PlayerIntentExtraction.model_validate(
+        {
+            "inventory": [{"action": "add", "item_key": "staff_of_illusion", "quantity": 1, "owner": "self"}],
+            "commands": [],
+            "feasibility_checks": [
+                {
+                    "action": "add",
+                    "item_key": "staff_of_illusion",
+                    "question": "Can this be added right now?",
+                    "is_possible": True,
+                    "reason": "Item is on display in the shop.",
+                    "would_be_theft": True,
+                    "acquisition_mode": "pickup",
+                }
+            ],
+        }
+    )
+    constraints = svc._runtime_constraints_from_intent(  # type: ignore[arg-type]
+        None,
+        None,
+        None,
+        state,
+        intent,
+        user_input="I take the staff of illusion and pocket it.",
+    )
+    assert any("would be theft" in c for c in constraints)
+
+
+def test_resolve_inventory_add_purchase_deducts_currency() -> None:
+    svc = GameService(LLMAdapter())
+    from types import SimpleNamespace
+
+    state = WorldState(
+        scene="A magic shop full of curios.",
+        party={"Hero": CharacterState(name="Hero", hp=10, max_hp=10, inventory={"gold_coins": 100})},
+    )
+    intent = PlayerIntentExtraction.model_validate(
+        {
+            "inventory": [{"action": "add", "item_key": "healing_potion", "quantity": 1, "owner": "self"}],
+            "commands": [],
+            "feasibility_checks": [
+                {
+                    "action": "add",
+                    "item_key": "healing_potion",
+                    "question": "Can purchase complete?",
+                    "is_possible": True,
+                    "reason": "Shop has stock.",
+                    "requires_payment": True,
+                    "cost_amount": 25,
+                    "currency": "gold",
+                    "has_required_funds": True,
+                    "acquisition_mode": "purchase",
+                    "would_be_theft": False,
+                }
+            ],
+        }
+    )
+    svc.player_character_name = lambda _db, campaign_id, player_id: "Hero"  # type: ignore[method-assign]
+    result = svc._resolve_inventory_actions_from_intent(  # noqa: SLF001
+        db=None,
+        campaign=SimpleNamespace(id=1),
+        player=SimpleNamespace(id=1),
+        current_state=state,
+        intent=intent,
+        user_input="I purchase a healing potion.",
+    )
+    assert result is not None
+    add_cmd = next((c for c in result["accepted"] if c.type == "add_item" and c.key == "healing_potion"), None)
+    pay_cmd = next((c for c in result["accepted"] if c.type == "remove_item" and c.key == "gold_coins"), None)
+    assert add_cmd is not None
+    assert pay_cmd is not None
+    assert int(pay_cmd.amount or 0) == 25
+
+
 def test_infeasible_check_forces_failure_narration() -> None:
     svc = GameService(LLMAdapter())
     intent = PlayerIntentExtraction.model_validate(

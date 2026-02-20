@@ -22,7 +22,7 @@ Recommended endpoint:
 System logs are written to:
 
 - filesystem log files in `AIGM_LOG_DIR`
-- database table `system_logs`
+- database table `system_logs` via DB API batch ingestion (`POST /db/v1/logs/system/batch`)
 
 Log controls:
 
@@ -35,6 +35,14 @@ Log controls:
 - `AIGM_HEALTH_ALERT_WEBHOOK_URL`
 - `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S`
 - `AIGM_SECRET_ROTATION_MAX_AGE_DAYS`
+- `AIGM_ALERT_TURN_STALL_S`
+- `AIGM_ALERT_TURN_STALL_QUEUE_DEPTH`
+- `AIGM_ALERT_FALLBACK_WINDOW_S`
+- `AIGM_ALERT_FALLBACK_THRESHOLD`
+- `AIGM_ALERT_LATENCY_WINDOW_S`
+- `AIGM_ALERT_LATENCY_THRESHOLD_MS`
+- `AIGM_ALERT_LATENCY_BREACH_COUNT`
+- `AIGM_ALERT_RUNTIME_COOLDOWN_S`
 
 Use **System Logs** filters by service, level, time window, and message search.
 
@@ -51,6 +59,10 @@ Webhook alerting:
 - When consecutive health failures reach threshold, supervisor emits an error log.
 - If `AIGM_HEALTH_ALERT_WEBHOOK_URL` is configured, supervisor POSTs a JSON alert payload.
 - Cooldown is controlled by `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S` to prevent alert spam.
+- Runtime alerts are also emitted for:
+  - stalled turn processing (queue depth + no recent turn metrics)
+  - repeated LLM fallback events
+  - latency anomaly bursts (repeated high-latency turn successes)
 
 ## Admin Audit Trail
 

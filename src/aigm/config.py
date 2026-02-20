@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     db_api_port: int = 9542
     db_api_url: str = "http://127.0.0.1:9542"
     db_api_token: str = ""
+    gameplay_use_db_api: bool = False
     component_state_dir: str = "./component_state"
     healthcheck_url: str = "http://127.0.0.1:9540/health"
     health_log_interval_s: int = 30
@@ -72,6 +73,28 @@ class Settings(BaseSettings):
     discord_rate_limit_window_s: int = 10
     discord_rate_limit_max_messages: int = 6
     turn_conflict_retries: int = 1
+    turn_worker_queue_max: int = 200
+    turn_worker_count: int = 2
+    llm_circuit_breaker_failure_threshold: int = 5
+    llm_circuit_breaker_reset_s: int = 60
+    management_api_rate_limit_window_s: int = 60
+    management_api_rate_limit_max_requests: int = 180
+    management_api_mutation_rate_limit_window_s: int = 60
+    management_api_mutation_rate_limit_max_requests: int = 60
+    alert_turn_stall_s: int = 120
+    alert_turn_stall_queue_depth: int = 1
+    alert_fallback_window_s: int = 300
+    alert_fallback_threshold: int = 5
+    alert_latency_window_s: int = 300
+    alert_latency_threshold_ms: int = 20000
+    alert_latency_breach_count: int = 3
+    alert_runtime_cooldown_s: int = 120
+    management_api_idempotency_ttl_s: int = 3600
+    management_api_idempotency_max_entries: int = 2000
+    service_api_http_max_retries: int = 2
+    service_api_http_retry_backoff_s: float = 0.5
+    service_api_circuit_breaker_failure_threshold: int = 5
+    service_api_circuit_breaker_reset_s: int = 60
 
     model_config = SettingsConfigDict(env_prefix="AIGM_", env_file=".env", extra="ignore")
 
