@@ -1,0 +1,8 @@
+{
+  "story_continuation_failure": "Dawn breaks over a frontier town built beside ancient ruins. You try it, but the world pushes back before your action can fully resolve: I pickup a lunchbox and scoop up 10 children into it to save for food later.. People nearby react with alarm, and the situation escalates around you. What do you do next?",
+  "infeasible_enforced": "You attempt the action, but it fails: 'ancient ruins' is a structure and is not portable.",
+  "prompt_leakage_stripped": "You try to lift the nearby house.",
+  "appearance_self_inspection": "You are **Oscar Mayer**. A cheerful bard in a bright red scarf.",
+  "equipment_self_inspection": "You are currently carrying: 1 coin pouch, 1 lute.",
+  "empty_inventory_self_inspection": "You are not carrying any items right now."
+}
