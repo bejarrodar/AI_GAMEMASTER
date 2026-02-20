@@ -721,7 +721,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [x] LLM robustness: replace scene-affordance pickup heuristics with explicit LLM feasibility checks (item availability + rationale + confidence), keeping deterministic fallback only for outage paths.
 - [x] LLM robustness: migrate inventory intent parsing from regex-first to LLM-first (regex only as emergency extractor fallback with no silent state mutation).
 - [x] LLM robustness: replace deterministic object portability classifier with model-provided `object_type`/`portability` + confidence calibration.
-- [ ] LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
+- [x] LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
 - [x] LLM robustness: replace heuristic purchase/currency checks with ruleset-aware transaction intent extraction (cost, currency, quantity) and explicit validation.
 - [ ] LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
 - [x] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
@@ -904,6 +904,7 @@ Already implemented:
 - Discord turn workers now emit periodic typing indicators while long turns are being processed.
 - LLM context packing now enforces configurable hard character budgets with truncation diagnostics (`AIGM_CONTEXT_TOKEN_BUDGET_CHARS`, `AIGM_CONTEXT_TRUNCATION_DIAGNOSTICS`).
 - Command suggestion routing now enforces minimum LLM confidence (`AIGM_COMMAND_SUGGESTION_MIN_CONFIDENCE`) and uses string-similarity only as last-resort fallback.
+- Self-inspection handling now uses intent classification (`appearance`/`equipment`) via LLM adapter with fallback classifier, while responses still come deterministically from saved character description/inventory.
 
 ## Design notes for your goals
 

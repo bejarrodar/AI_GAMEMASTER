@@ -1603,6 +1603,120 @@ class LLMAdapter:
             return {"matched_command": match[0], "confidence": 0.75, "reason": "string_similarity"}
         return {"matched_command": None, "confidence": 0.0, "reason": "no_match"}
 
+    @staticmethod
+    def _fallback_classify_self_query_intent(user_input: str) -> dict:
+        text = (user_input or "").strip().lower()
+        if not text:
+            return {"intent": "none", "confidence": 0.0, "reason": "empty"}
+        appearance_markers = (
+            "what do i look like",
+            "how do i look",
+            "describe me",
+            "my appearance",
+            "what am i wearing",
+        )
+        equipment_markers = (
+            "what am i equipped with",
+            "what am i equipped wi th",
+            "what am i carrying",
+            "what do i have equipped",
+            "show my inventory",
+            "what is in my inventory",
+            "what do i have in my inventory",
+            "what am i holding",
+        )
+        if any(p in text for p in appearance_markers):
+            return {"intent": "appearance", "confidence": 0.95, "reason": "fallback_phrase_match"}
+        if any(p in text for p in equipment_markers):
+            return {"intent": "equipment", "confidence": 0.95, "reason": "fallback_phrase_match"}
+        return {"intent": "none", "confidence": 0.0, "reason": "no_match"}
+
+    def _classify_self_query_intent_with_ollama(self, user_input: str) -> dict:
+        prompt = (
+            "Return JSON only with this shape: "
+            '{"intent":"appearance|equipment|none","confidence":0.0,"reason":"string"}\n\n'
+            "Classify whether this player message is asking to inspect their own character appearance or equipment/inventory.\n"
+            f"input={user_input}"
+        )
+        payload = {
+            "model": self._model_for_task("intent"),
+            "messages": [
+                {"role": "system", "content": "You classify player self-query intents."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "options": self._options_for_task("intent"),
+        }
+        if settings.llm_json_mode_strict:
+            payload["format"] = "json"
+        req = request.Request(
+            url=f"{settings.ollama_url.rstrip('/')}/api/chat",
+            method="POST",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        body = self._urlopen_json_with_retry(req, timeout_s=max(8, min(20, settings.ollama_timeout_s)))
+        content = body.get("message", {}).get("content", "")
+        parsed = self._extract_json_object(content) if content else {}
+        intent = str(parsed.get("intent", "") or "none").strip().lower()
+        if intent not in {"appearance", "equipment", "none"}:
+            intent = "none"
+        confidence = parsed.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        reason = str(parsed.get("reason", "") or "").strip() or "llm_inference"
+        return {"intent": intent, "confidence": max(0.0, min(1.0, confidence)), "reason": reason}
+
+    def _classify_self_query_intent_with_openai(self, user_input: str) -> dict:
+        prompt = (
+            "Return JSON only with this shape: "
+            '{"intent":"appearance|equipment|none","confidence":0.0,"reason":"string"}\n\n'
+            f"input={user_input}"
+        )
+        parsed = self._chat_json_with_openai(
+            task="intent",
+            system_prompt="You classify player self-query intents.",
+            user_prompt=prompt,
+        )
+        intent = str(parsed.get("intent", "") or "none").strip().lower()
+        if intent not in {"appearance", "equipment", "none"}:
+            intent = "none"
+        confidence = parsed.get("confidence", 0.0)
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        reason = str(parsed.get("reason", "") or "").strip() or "llm_inference"
+        return {"intent": intent, "confidence": max(0.0, min(1.0, confidence)), "reason": reason}
+
+    def classify_self_query_intent(self, user_input: str) -> dict:
+        provider = settings.llm_provider.strip().lower()
+        if provider == "ollama":
+            if self._circuit_is_open("ollama"):
+                return self._fallback_classify_self_query_intent(user_input)
+            try:
+                out = self._classify_self_query_intent_with_ollama(user_input)
+                if out.get("intent") in {"appearance", "equipment"}:
+                    self._record_provider_success("ollama")
+                    return out
+            except (error.URLError, TimeoutError, json.JSONDecodeError, ValueError) as exc:
+                self._record_provider_failure("ollama")
+                print(f"[LLMAdapter] Self-query classification via Ollama failed, using fallback: {type(exc).__name__}: {exc}")
+        elif provider == "openai":
+            if self._circuit_is_open("openai"):
+                return self._fallback_classify_self_query_intent(user_input)
+            try:
+                out = self._classify_self_query_intent_with_openai(user_input)
+                if out.get("intent") in {"appearance", "equipment"}:
+                    self._record_provider_success("openai")
+                    return out
+            except Exception as exc:  # noqa: BLE001
+                self._record_provider_failure("openai")
+                print(f"[LLMAdapter] Self-query classification via OpenAI failed, using fallback: {type(exc).__name__}: {exc}")
+        return self._fallback_classify_self_query_intent(user_input)
+
     def _infer_discord_command_with_ollama(self, user_input: str, possible_commands: list[str]) -> dict:
         prompt = (
             "Return JSON only with this shape: "

@@ -792,36 +792,13 @@ class GameService:
         text = (user_input or "").strip().lower()
         if not text:
             return None
-
-        asks_appearance = any(
-            phrase in text
-            for phrase in (
-                "what do i look like",
-                "how do i look",
-                "describe me",
-                "my appearance",
-                "what am i wearing",
-            )
-        )
-        if asks_appearance:
+        classification = self.llm.classify_self_query_intent(user_input)
+        intent = str(classification.get("intent", "none") or "none").strip().lower()
+        if intent == "appearance":
             if char.description.strip():
                 return f"You are **{char.name}**. {char.description.strip()}"
             return f"You are **{char.name}**. Your appearance is still undefined."
-
-        asks_equipment = any(
-            phrase in text
-            for phrase in (
-                "what am i equipped with",
-                "what am i equipped wi th",
-                "what am i carrying",
-                "what do i have equipped",
-                "show my inventory",
-                "what is in my inventory",
-                "what do i have in my inventory",
-                "what am i holding",
-            )
-        )
-        if asks_equipment:
+        if intent == "equipment":
             items = self._format_inventory_list(char.inventory)
             if items:
                 return f"You are currently carrying: {items}."

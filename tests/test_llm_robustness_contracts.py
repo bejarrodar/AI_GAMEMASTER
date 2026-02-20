@@ -236,3 +236,26 @@ def test_command_inference_accepts_high_confidence_llm_guess(monkeypatch) -> Non
     adapter = LLMAdapter()
     out = adapter.infer_discord_command("!mycharcter hero", ["!mycharacter", "!gmhelp"])
     assert out["matched_command"] == "!mycharacter"
+
+
+def test_self_query_classifier_fallback_detects_equipment_intent() -> None:
+    out = LLMAdapter._fallback_classify_self_query_intent("What am I equipped with?")
+    assert out["intent"] == "equipment"
+    assert float(out["confidence"]) > 0.0
+
+
+def test_self_query_classifier_openai_used_for_self_inspection(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "llm_provider", "openai")
+    monkeypatch.setattr(
+        LLMAdapter,
+        "_classify_self_query_intent_with_openai",
+        lambda _self, _input: {"intent": "appearance", "confidence": 0.95, "reason": "llm_intent"},
+    )
+    svc = GameService(LLMAdapter())
+    state = WorldState(
+        scene="Town square",
+        party={"Shade": CharacterState(name="Shade", description="A cloaked wanderer.", hp=10, max_hp=10)},
+    )
+    out = svc._self_inspection_narration(state, "Shade", "What do I look like?")  # noqa: SLF001
+    assert out is not None
+    assert "A cloaked wanderer." in out
