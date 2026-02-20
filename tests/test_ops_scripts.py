@@ -55,3 +55,28 @@ def test_nightly_soak_smoke_run_returns_summary_shape() -> None:
     output = proc.stdout.lower()
     assert "latency_ms" in output
     assert "memory_mb" in output
+
+
+def test_benchmark_modes_smoke_run_outputs_cases() -> None:
+    cmd = [
+        sys.executable,
+        "scripts/benchmark_modes.py",
+        "--turns",
+        "5",
+        "--players",
+        "2",
+        "--thread-prefix",
+        "bench-smoke",
+        "--database-url",
+        "sqlite:///:memory:",
+        "--max-failures",
+        "10",
+        "--max-p95-ms",
+        "99999",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    assert proc.returncode == 0, proc.stdout + "\n" + proc.stderr
+    out = proc.stdout.lower()
+    assert '"label": "dnd"' in out
+    assert '"label": "story"' in out
+    assert '"label": "crew"' in out

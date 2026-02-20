@@ -123,6 +123,8 @@ async def _turn_worker() -> None:
     assert turn_job_queue is not None
     while True:
         job = await turn_job_queue.get()
+        typing_stop = asyncio.Event()
+        typing_task = asyncio.create_task(_typing_indicator_loop(job.channel, typing_stop, interval_s=8.0))
         try:
             narration, details = await asyncio.to_thread(_process_turn_sync, job)
             diagnostics = ""
@@ -132,7 +134,27 @@ async def _turn_worker() -> None:
         except Exception as exc:  # noqa: BLE001
             await job.channel.send(f"Turn processing failed: {exc}")
         finally:
+            typing_stop.set()
+            try:
+                await typing_task
+            except Exception:
+                pass
             turn_job_queue.task_done()
+
+
+async def _typing_indicator_loop(channel: discord.abc.Messageable, stop_event: asyncio.Event, interval_s: float = 8.0) -> None:
+    delay = max(2.0, float(interval_s))
+    while not stop_event.is_set():
+        try:
+            trigger_typing = getattr(channel, "trigger_typing", None)
+            if callable(trigger_typing):
+                await trigger_typing()
+        except Exception:
+            return
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            continue
 
 
 def _process_turn_sync(job: TurnJob) -> tuple[str, dict]:

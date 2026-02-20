@@ -130,3 +130,24 @@ def test_discord_contract_unknown_command_suggests_closest(monkeypatch) -> None:
     payload = channel.sent[-1]
     assert "Unknown command `!mycharcter`." in payload
     assert "Closest valid command: `!mycharacter`" in payload
+
+
+def test_typing_indicator_loop_triggers_typing_until_stopped() -> None:
+    class _TypingChannel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def trigger_typing(self):
+            self.calls += 1
+
+    async def _run() -> int:
+        channel = _TypingChannel()
+        stop = asyncio.Event()
+        task = asyncio.create_task(bot_module._typing_indicator_loop(channel, stop, interval_s=0.05))
+        await asyncio.sleep(0.12)
+        stop.set()
+        await task
+        return channel.calls
+
+    calls = asyncio.run(_run())
+    assert calls >= 1

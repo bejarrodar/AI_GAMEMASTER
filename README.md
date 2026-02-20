@@ -728,8 +728,8 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] LLM roadmap: design and train a dedicated intent-to-JSON model specialized for command/turn parsing reliability.
 - [ ] LLM roadmap: design a dual-model architecture (`parser model` + `story model`) with separate eval suites and routing policy.
 - [ ] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
-- [ ] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
-- [ ] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
+- [x] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
+- [x] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
 - [ ] Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
 - [ ] Gameplay systems: expand configurable ruleset packs beyond current baseline (additional systems/editions, deeper mechanics metadata, compatibility layers).
 - [ ] Gameplay systems: add initiative/order/combat toolkit and encounter state tracking.
@@ -896,10 +896,12 @@ Already implemented:
 - Formal model-evaluation regression harness is available (`scripts/model_eval_regression.py`, `scripts/model_eval_cases.json`).
 - CI gates run lint, tests, health endpoint tests, `pip-audit`, and `pip check`.
 - Chaos resilience tests now cover DB API outage/retry/circuit-breaker behavior plus Ollama outage/timeout fallback paths (`tests/test_chaos_resilience.py`).
-- Discord command contract tests now validate command surface basics, help output, pre-start command gating, and unknown-command suggestions (`tests/test_discord_command_contracts.py`).
+- Discord command contract tests now validate command surface basics, help output, pre-start command gating, unknown-command suggestions, and typing-indicator streaming behavior (`tests/test_discord_command_contracts.py`).
 - Narration quality snapshot regression tests now cover critical deterministic paths (story-continuation fallback, infeasible-action narration, prompt-leak stripping, self-inspection outputs) in `tests/test_narration_snapshots.py` with baseline snapshots in `tests/snapshots/narration_quality_v1.json`.
 - Nightly soak coverage is implemented with long-running turn simulation and memory-growth thresholds in `scripts/nightly_soak.py` (deterministic LLM adapter for CI-safe execution).
 - One-command diagnostics bundles are implemented in `scripts/diagnostics_bundle.py` (runtime config snapshot, health checks, metrics, recent DB logs, optional local log tails, zipped artifact).
+- A benchmark suite for throughput/latency by mode (`dnd`, `story`, `crew`) is available in `scripts/benchmark_modes.py`.
+- Discord turn workers now emit periodic typing indicators while long turns are being processed.
 
 ## Design notes for your goals
 
