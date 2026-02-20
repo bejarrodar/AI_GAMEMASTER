@@ -673,7 +673,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [x] Reliability: define formal SLOs/SLIs (turn latency, success rate, health uptime) with alert routing and on-call escalation docs.
 - [ ] Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
 - [x] Reliability: add circuit breakers around LLM provider failures and queue overload with graceful degradation modes.
-- [ ] Reliability: add idempotent message processing keys to prevent duplicate turn application on retries/reconnects.
+- [x] Reliability: add idempotent message processing keys to prevent duplicate turn application on retries/reconnects.
 - [ ] Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
 - [x] Reliability: implement async worker queue for turn processing to isolate Discord event loop from heavy inference paths.
 - [x] Discord command surface: restore explicit pre-start game lifecycle commands (`!startgame`, `!startstory`) with thread gating.
@@ -819,6 +819,7 @@ All Basic Testing Readiness items are complete.
 42. Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
 43. Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
 44. Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
+45. Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
 
 Already implemented:
 
