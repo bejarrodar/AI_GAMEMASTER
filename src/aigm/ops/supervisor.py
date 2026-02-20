@@ -73,19 +73,26 @@ def parse_aigm_metric_line(line: str) -> dict | None:
 
 
 _TRACEBACK_SUMMARY_RE = re.compile(r"^[A-Za-z_][\w.]*:\s+.+$")
+_LOG_PREFIX_RE = re.compile(r"^(?:\[[^\]]+\]\s*)+")
+
+
+def _strip_log_prefix(line: str) -> str:
+    text = line or ""
+    return _LOG_PREFIX_RE.sub("", text, count=1)
 
 
 def is_traceback_start(line: str) -> bool:
-    return (line or "").startswith("Traceback (most recent call last):")
+    text = _strip_log_prefix(line)
+    return text.startswith("Traceback (most recent call last):")
 
 
 def is_traceback_line(line: str) -> bool:
-    text = line or ""
+    text = _strip_log_prefix(line)
     if not text:
         return True
     if is_traceback_start(text):
         return True
-    if text.startswith("  File "):
+    if text.startswith("  File ") or text.startswith('File "'):
         return True
     if text.startswith("    "):
         return True

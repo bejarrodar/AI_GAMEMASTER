@@ -181,6 +181,7 @@ def test_post_json_webhook() -> None:
 def test_traceback_parsing_helpers() -> None:
     assert supervisor.is_traceback_start("Traceback (most recent call last):") is True
     assert supervisor.is_traceback_start("ValueError: boom") is False
+    assert supervisor.is_traceback_start("[bot-manager][Testing_Bot][stderr] Traceback (most recent call last):") is True
 
     assert supervisor.is_traceback_line("Traceback (most recent call last):") is True
     assert supervisor.is_traceback_line('  File "x.py", line 1, in <module>') is True
@@ -188,4 +189,6 @@ def test_traceback_parsing_helpers() -> None:
     assert supervisor.is_traceback_line("ValueError: bad input") is True
     assert supervisor.is_traceback_line("During handling of the above exception, another exception occurred:") is True
     assert supervisor.is_traceback_line("The above exception was the direct cause of the following exception:") is True
+    assert supervisor.is_traceback_line('[bot-manager][Testing_Bot][stderr]   File "x.py", line 1, in <module>') is True
+    assert supervisor.is_traceback_line("[bot-manager][Testing_Bot][stderr] ValueError: bad input") is True
     assert supervisor.is_traceback_line("[2026-02-15] INFO service started") is False

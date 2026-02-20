@@ -683,12 +683,12 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [x] Discord command surface: restore turn retry command (`!retry`) with state rollback guarantees.
 - [x] Discord command surface: restore `!teach` command and LLM-based unknown-command validation/suggestions.
 - [x] Discord command surface: restore per-campaign engine command (`!agentmode [classic|crew]`).
-- [ ] Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
+- [x] Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
 - [x] Observability: add distributed correlation IDs across Discord message -> turn -> LLM calls -> DB writes.
 - [x] Observability: add structured JSON logging baseline and log schemas for all services/scripts.
 - [x] Observability: move component log writes to API calls (`management_api`/`db_api`) so all persisted logs flow through versioned endpoints instead of direct DB sessions.
 - [x] Observability: add logging coverage audit + checklist to identify unlogged paths and enforce minimum log events for startup, command handling, API mutations, retries/fallbacks, and failures.
-- [ ] Observability: add multiline error/traceback ingestion contract across all components (preserve single logical error entries end-to-end in DB/UI/API).
+- [x] Observability: add multiline error/traceback ingestion contract across all components (preserve single logical error entries end-to-end in DB/UI/API).
 - [x] Observability: add alert rules for stalled turns, repeated fallback usage, and token/latency anomalies.
 - [ ] Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
 - [ ] Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
@@ -725,6 +725,8 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [x] LLM robustness: replace heuristic purchase/currency checks with ruleset-aware transaction intent extraction (cost, currency, quantity) and explicit validation.
 - [ ] LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
 - [ ] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
+- [ ] LLM roadmap: design and train a dedicated intent-to-JSON model specialized for command/turn parsing reliability.
+- [ ] LLM roadmap: design a dual-model architecture (`parser model` + `story model`) with separate eval suites and routing policy.
 - [ ] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
 - [ ] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
 - [ ] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
@@ -758,8 +760,7 @@ Use this sequence for implementation and validation so the platform remains test
 
 #### Immediate Attention (stability + correctness first)
 
-1. Observability: add multiline error/traceback ingestion contract across all components (preserve single logical error entries end-to-end in DB/UI/API).
-2. Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
+All previously listed immediate items are complete. Continue with Basic Testing Readiness items below.
 
 #### Basic Testing Readiness (production-like validation baseline)
 
@@ -772,9 +773,8 @@ Use this sequence for implementation and validation so the platform remains test
 7. API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
 8. Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
 9. Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
-10. Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
-11. Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
-12. Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
+10. Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
+11. Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
 
 #### Nice-to-Have (scale, UX, and expansion)
 
@@ -790,36 +790,38 @@ Use this sequence for implementation and validation so the platform remains test
 10. LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
 11. LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
 12. LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
-13. Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
-14. Performance: add response streaming path (Discord typing/partial status updates) for long generations.
-15. Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
-16. Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
-17. Gameplay systems: expand configurable ruleset packs beyond current baseline (additional systems/editions, deeper mechanics metadata, compatibility layers).
-18. Gameplay systems: add initiative/order/combat toolkit and encounter state tracking.
-19. Gameplay systems: add economy subsystem (currency validation, pricing tables, purchase checks).
-20. Knowledge systems: expand rulebook ingestion pipeline with stronger provenance/citation enforcement and bulk import tooling.
-21. Knowledge systems: expand retrieval/ranking with confidence scoring and citation quality controls.
-22. Knowledge systems: add approval workflow + provenance history for custom lore/books authoring.
-23. Knowledge systems: add world encyclopedia entities (items, factions, locations, spells, effects) with admin curation.
-24. GM profiles: add selectable GM styles (genre + personality presets) and per-campaign style overrides.
-25. GM profiles: add safety/style guardrails per profile (tone bounds, violence bounds, forbidden content).
-26. UX/theming: add theme manager (icons, palettes, typography, layout presets) with user-level preferences.
-27. UX/theming: add campaign presentation skins (fantasy/sci-fi/horror) and visual assets mapping.
-28. UX/theming: add accessibility pass (contrast, keyboard nav, reduced motion, screen-reader labels).
-29. Collaboration: add concurrent speaker handling policy (message ordering windows, simultaneous action resolution).
-30. Collaboration: add GM moderation tools (pause/resume thread, soft-delete turn, annotate rulings).
-31. Import/export: add granular export/import scopes (characters, rules, inventory, world, logs, memories, bots).
-32. Import/export: add signed/verified backup bundles for secure transfer between threads/servers.
-33. Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
-34. Operations: add issue tracking page in Streamlit with triage workflow (status, severity, owner, resolution notes) backed by `!reportissue` and admin-created issues.
-35. Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
-36. Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
-37. Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
-38. Data governance: add PII redaction controls for logs, prompts, and exports.
-39. Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
-40. Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
-41. Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
-42. Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
+13. LLM roadmap: design and train a dedicated intent-to-JSON model specialized for command/turn parsing reliability.
+14. LLM roadmap: design a dual-model architecture (`parser model` + `story model`) with separate eval suites and routing policy.
+15. Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
+16. Performance: add response streaming path (Discord typing/partial status updates) for long generations.
+17. Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
+18. Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
+19. Gameplay systems: expand configurable ruleset packs beyond current baseline (additional systems/editions, deeper mechanics metadata, compatibility layers).
+20. Gameplay systems: add initiative/order/combat toolkit and encounter state tracking.
+21. Gameplay systems: add economy subsystem (currency validation, pricing tables, purchase checks).
+22. Knowledge systems: expand rulebook ingestion pipeline with stronger provenance/citation enforcement and bulk import tooling.
+23. Knowledge systems: expand retrieval/ranking with confidence scoring and citation quality controls.
+24. Knowledge systems: add approval workflow + provenance history for custom lore/books authoring.
+25. Knowledge systems: add world encyclopedia entities (items, factions, locations, spells, effects) with admin curation.
+26. GM profiles: add selectable GM styles (genre + personality presets) and per-campaign style overrides.
+27. GM profiles: add safety/style guardrails per profile (tone bounds, violence bounds, forbidden content).
+28. UX/theming: add theme manager (icons, palettes, typography, layout presets) with user-level preferences.
+29. UX/theming: add campaign presentation skins (fantasy/sci-fi/horror) and visual assets mapping.
+30. UX/theming: add accessibility pass (contrast, keyboard nav, reduced motion, screen-reader labels).
+31. Collaboration: add concurrent speaker handling policy (message ordering windows, simultaneous action resolution).
+32. Collaboration: add GM moderation tools (pause/resume thread, soft-delete turn, annotate rulings).
+33. Import/export: add granular export/import scopes (characters, rules, inventory, world, logs, memories, bots).
+34. Import/export: add signed/verified backup bundles for secure transfer between threads/servers.
+35. Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
+36. Operations: add issue tracking page in Streamlit with triage workflow (status, severity, owner, resolution notes) backed by `!reportissue` and admin-created issues.
+37. Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
+38. Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
+39. Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
+40. Data governance: add PII redaction controls for logs, prompts, and exports.
+41. Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
+42. Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
+43. Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
+44. Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
 
 Already implemented:
 
@@ -858,6 +860,7 @@ Already implemented:
 - Supervisor health alerts are configurable (`AIGM_HEALTH_LOG_INTERVAL_S`, `AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES`).
 - Supervisor can send health alerts to webhook endpoints (`AIGM_HEALTH_ALERT_WEBHOOK_URL`, `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S`).
 - Supervisor runtime alerts are available for stalled turns, fallback spikes, and latency anomalies (`AIGM_ALERT_*` settings).
+- Supervisor traceback coalescing now handles prefixed subprocess lines (e.g., bot-manager stderr prefixes) so multi-line exceptions persist as a single logical log entry.
 - Turn success/failure counters and latency sums are exported on `/metrics` (plus log queue depth gauge).
 - Streamlit UI now uses Management/DB APIs for campaign/gameplay/auth/admin operations without direct `SessionLocal` DB access in the UI layer.
 - Management API now includes rate limits for read and mutation paths (`AIGM_MANAGEMENT_API_RATE_LIMIT_*`).
@@ -894,6 +897,7 @@ Already implemented:
   - Discord commands `!showruleset`, `!setruleset`, `!rulelookup`, `!roll`
 - Formal model-evaluation regression harness is available (`scripts/model_eval_regression.py`, `scripts/model_eval_cases.json`).
 - CI gates run lint, tests, health endpoint tests, `pip-audit`, and `pip check`.
+- Chaos resilience tests now cover DB API outage/retry/circuit-breaker behavior plus Ollama outage/timeout fallback paths (`tests/test_chaos_resilience.py`).
 
 ## Design notes for your goals
 
