@@ -23,6 +23,8 @@ AI Game Master backend for Discord thread-based games, with **strict state valid
      - `!adminlogout`
      - `!adminrules`
      - `!adminrule add|update|remove ...`
+     - `!admindlq list [status] [limit]`
+     - `!admindlq replay <event_id>`
      - `!setrule key=value`
      - `!agencyprofiles`
      - `!setagencyprofile <profile>`
@@ -66,6 +68,7 @@ AI Game Master backend for Discord thread-based games, with **strict state valid
    - `inventory_items`: normalized inventory per player.
    - `campaign_rules`: custom rule overrides by thread.
    - `feedback`: quality feedback for model tuning.
+   - `dead_letter_events`: failed queue/turn jobs awaiting replay.
    - `admin_audit_logs`: append-only audit trail for admin operations.
    - Global learned relevance + knowledge for items/effects across all campaigns.
 
@@ -674,7 +677,7 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
 - [x] Reliability: add circuit breakers around LLM provider failures and queue overload with graceful degradation modes.
 - [x] Reliability: add idempotent message processing keys to prevent duplicate turn application on retries/reconnects.
-- [ ] Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
+- [x] Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
 - [x] Reliability: implement async worker queue for turn processing to isolate Discord event loop from heavy inference paths.
 - [x] Discord command surface: restore explicit pre-start game lifecycle commands (`!startgame`, `!startstory`) with thread gating.
 - [x] Discord command surface: restore `!gmhelp` command discovery/help output.
@@ -864,6 +867,7 @@ Already implemented:
 - Management API now includes rate limits for read and mutation paths (`AIGM_MANAGEMENT_API_RATE_LIMIT_*`).
 - Management API debug surfaces now have dedicated per-endpoint quota controls (`AIGM_MANAGEMENT_API_DEBUG_RATE_LIMIT_*`) in addition to global read/mutation limits.
 - Discord turn handling now uses a bounded async worker queue (`AIGM_TURN_WORKER_QUEUE_MAX`, `AIGM_TURN_WORKER_COUNT`) with graceful queue-full responses.
+- Failed turn jobs/queue overflows are now persisted to `dead_letter_events` with admin replay tooling (`!admindlq list`, `!admindlq replay <event_id>`).
 - LLM provider circuit-breaker safeguards are implemented (`AIGM_LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `AIGM_LLM_CIRCUIT_BREAKER_RESET_S`).
 - Logging coverage checklist documentation is available at `docs/LOGGING_COVERAGE_CHECKLIST.md`.
 - Structured logging schema baseline is documented at `docs/LOG_SCHEMA.md` (`aigm.log.v1`).

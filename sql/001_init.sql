@@ -326,3 +326,22 @@ CREATE TABLE IF NOT EXISTS bot_configs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS dead_letter_events (
+    id SERIAL PRIMARY KEY,
+    event_type VARCHAR(64) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'open',
+    campaign_id INTEGER REFERENCES campaigns(id) ON DELETE SET NULL,
+    discord_thread_id VARCHAR(64) NOT NULL DEFAULT '',
+    discord_message_id VARCHAR(64) NOT NULL DEFAULT '',
+    actor_discord_user_id VARCHAR(64) NOT NULL DEFAULT '',
+    actor_display_name VARCHAR(128) NOT NULL DEFAULT '',
+    user_input TEXT NOT NULL DEFAULT '',
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    error_message TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 3,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    replayed_at TIMESTAMPTZ
+);

@@ -7,7 +7,7 @@ This file documents all Discord commands implemented by the bot in `src/aigm/bot
 - Commands are processed only in **thread channels** (`public_thread` or `private_thread`).
 - In non-thread channels, `!` commands receive a guidance message.
 - A thread must be started with `!startgame` before the bot responds to normal prompts or other commands.
-- Before game start, only `!startgame`, `!startstory`, `!gmhelp`, `!adminauth`, `!importcampaign`, and `!adminrestorecampaign` are processed.
+- Before game start, only `!startgame`, `!startstory`, `!gmhelp`, `!adminauth`, `!importcampaign`, `!adminrestorecampaign`, and `!admindlq` are processed.
 - If `AIGM_AUTH_ENFORCE=true`, command access is permission-gated by RBAC (with sys_admin fallback).
 
 ## Health / Utility
@@ -152,6 +152,15 @@ This file documents all Discord commands implemented by the bot in `src/aigm/bot
 
 - `!adminrule remove <rule_id>`
   - Removes a system agency rule block.
+  - Admin-only.
+
+- `!admindlq list [status] [limit]`
+  - Lists dead-letter events for failed queue/turn processing.
+  - Optional `status` filter (`open`, `replayed`, `failed`).
+  - Admin-only.
+
+- `!admindlq replay <event_id>`
+  - Replays a dead-letter turn job by id.
   - Admin-only.
 
 ## Notes

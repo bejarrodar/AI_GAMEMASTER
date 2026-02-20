@@ -66,6 +66,31 @@ class ProcessedDiscordMessage(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
 
 
+class DeadLetterEvent(Base):
+    __tablename__ = "dead_letter_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="open", index=True)
+    campaign_id: Mapped[int | None] = mapped_column(
+        ForeignKey("campaigns.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    discord_thread_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    discord_message_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    actor_discord_user_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", index=True)
+    actor_display_name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    user_input: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    error_message: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+
+
 class Player(Base):
     __tablename__ = "players"
     __table_args__ = (UniqueConstraint("campaign_id", "discord_user_id", name="uq_player_campaign_discord_user"),)

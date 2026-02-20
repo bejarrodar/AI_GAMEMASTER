@@ -242,6 +242,44 @@ class DBApiClient:
         )
         return bool(payload.get("reserved", False))
 
+    def create_dead_letter_event(
+        self,
+        *,
+        event_type: str,
+        campaign_id: int | None,
+        discord_thread_id: str = "",
+        discord_message_id: str = "",
+        actor_discord_user_id: str = "",
+        actor_display_name: str = "",
+        user_input: str = "",
+        error_message: str = "",
+        payload: dict | None = None,
+        max_attempts: int = 3,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/db/v1/dead-letters",
+            payload={
+                "event_type": event_type,
+                "campaign_id": campaign_id,
+                "discord_thread_id": discord_thread_id,
+                "discord_message_id": discord_message_id,
+                "actor_discord_user_id": actor_discord_user_id,
+                "actor_display_name": actor_display_name,
+                "user_input": user_input,
+                "error_message": error_message,
+                "payload": dict(payload or {}),
+                "max_attempts": int(max_attempts),
+            },
+        )
+
+    def list_dead_letter_events(self, *, status: str = "", limit: int = 50) -> list[dict]:
+        query: dict[str, str | int] = {"limit": int(limit)}
+        if status:
+            query["status"] = status
+        payload = self._request("GET", "/db/v1/dead-letters", query=query)
+        return list(payload.get("rows", []))
+
     def list_campaigns(self, *, limit: int = 200) -> list[dict]:
         payload = self._request("GET", "/db/v1/campaigns", query={"limit": int(limit)})
         return list(payload.get("rows", []))

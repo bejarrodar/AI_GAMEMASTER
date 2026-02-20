@@ -15,6 +15,7 @@ from aigm.db.models import (
     BotConfig,
     Campaign,
     CampaignRule,
+    DeadLetterEvent,
     DiceRollLog,
     EffectKnowledge,
     GlobalEffectRelevance,
@@ -435,6 +436,66 @@ class DBAPIState:
             db.commit()
             return {"reserved": True}
 
+    @staticmethod
+    def create_dead_letter_event(payload: dict) -> dict:
+        event_type = str(payload.get("event_type", "")).strip().lower()
+        if not event_type:
+            raise ValueError("event_type is required")
+        row_payload = payload.get("payload", {})
+        if not isinstance(row_payload, dict):
+            row_payload = {"raw_payload": row_payload}
+        with SessionLocal() as db:
+            row = DeadLetterEvent(
+                event_type=event_type,
+                status="open",
+                campaign_id=(int(payload["campaign_id"]) if payload.get("campaign_id") is not None else None),
+                discord_thread_id=str(payload.get("discord_thread_id", "") or ""),
+                discord_message_id=str(payload.get("discord_message_id", "") or ""),
+                actor_discord_user_id=str(payload.get("actor_discord_user_id", "") or ""),
+                actor_display_name=str(payload.get("actor_display_name", "") or "")[:128],
+                user_input=str(payload.get("user_input", "") or ""),
+                payload=row_payload,
+                error_message=str(payload.get("error_message", "") or ""),
+                attempt_count=0,
+                max_attempts=max(1, int(payload.get("max_attempts", 3) or 3)),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return {"id": row.id, "status": row.status}
+
+    @staticmethod
+    def list_dead_letter_events(status: str = "", limit: int = 50) -> list[dict]:
+        normalized = str(status or "").strip().lower()
+        with SessionLocal() as db:
+            q = db.query(DeadLetterEvent)
+            if normalized:
+                q = q.filter(DeadLetterEvent.status == normalized)
+            rows = q.order_by(DeadLetterEvent.id.desc()).limit(max(1, min(500, int(limit)))).all()
+            return [
+                {
+                    "id": row.id,
+                    "event_type": row.event_type,
+                    "status": row.status,
+                    "campaign_id": row.campaign_id,
+                    "discord_thread_id": row.discord_thread_id,
+                    "discord_message_id": row.discord_message_id,
+                    "actor_discord_user_id": row.actor_discord_user_id,
+                    "actor_display_name": row.actor_display_name,
+                    "user_input": row.user_input,
+                    "payload": dict(row.payload or {}),
+                    "error_message": row.error_message,
+                    "attempt_count": row.attempt_count,
+                    "max_attempts": row.max_attempts,
+                    "created_at": row.created_at.isoformat() if row.created_at else None,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                    "replayed_at": row.replayed_at.isoformat() if row.replayed_at else None,
+                }
+                for row in rows
+            ]
+
 
 def make_handler(state: DBAPIState):
     class DBHandler(BaseHTTPRequestHandler):
@@ -569,6 +630,11 @@ def make_handler(state: DBAPIState):
                     campaign_id = int(campaign_id_raw) if str(campaign_id_raw).strip() else None
                     self._send_json(200, {"ok": True, "rows": state.list_dice_roll_logs(limit, campaign_id)})
                     return
+                if path == "/db/v1/dead-letters":
+                    limit = int((query.get("limit", ["50"]) or ["50"])[0])
+                    status = str((query.get("status", [""]) or [""])[0]).strip().lower()
+                    self._send_json(200, {"ok": True, "rows": state.list_dead_letter_events(status, limit)})
+                    return
                 self._error(404, "not_found", "not_found")
             except Exception as exc:  # noqa: BLE001
                 self._error(500, "internal_error", str(exc))
@@ -619,6 +685,9 @@ def make_handler(state: DBAPIState):
                         200,
                         {"ok": True, **state.reserve_processed_message(campaign_id, discord_message_id, actor_discord_user_id)},
                     )
+                    return
+                if parsed.path == "/db/v1/dead-letters":
+                    self._send_json(201, {"ok": True, **state.create_dead_letter_event(payload)})
                     return
                 self._error(404, "not_found", "not_found")
             except ValueError as exc:

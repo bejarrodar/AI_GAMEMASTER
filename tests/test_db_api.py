@@ -9,6 +9,9 @@ from aigm.ops import db_api
 
 
 class _State:
+    def __init__(self) -> None:
+        self.dead_letters: list[dict] = []
+
     def auth_ok(self, authorization: str) -> bool:
         return authorization == "Bearer ok"
 
@@ -77,6 +80,24 @@ class _State:
 
     def list_dice_roll_logs(self, limit: int = 100, campaign_id: int | None = None) -> list[dict]:
         return [{"id": 1, "campaign_id": campaign_id, "expression": "d20", "total": 14, "limit": limit}]
+
+    def create_dead_letter_event(self, payload: dict) -> dict:
+        event_id = len(self.dead_letters) + 1
+        row = {
+            "id": event_id,
+            "event_type": str(payload.get("event_type", "")),
+            "status": "open",
+            "campaign_id": payload.get("campaign_id"),
+            "actor_discord_user_id": str(payload.get("actor_discord_user_id", "")),
+        }
+        self.dead_letters.append(row)
+        return {"id": event_id, "status": "open"}
+
+    def list_dead_letter_events(self, status: str = "", limit: int = 50) -> list[dict]:
+        rows = list(self.dead_letters)
+        if status:
+            rows = [r for r in rows if str(r.get("status", "")) == status]
+        return rows[: max(1, int(limit))]
 
 
 def _req(url: str, method: str = "GET", payload: dict | None = None) -> dict:
@@ -237,6 +258,28 @@ def test_db_api_knowledge_and_dice_endpoints() -> None:
         assert effects["ok"] is True and isinstance(effects["rows"], list)
         assert effect_rel["ok"] is True and isinstance(effect_rel["rows"], list)
         assert dice["ok"] is True and isinstance(dice["rows"], list)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_db_api_dead_letter_endpoints() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), db_api.make_handler(_State()))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        created = _req(
+            f"{base}/db/v1/dead-letters",
+            method="POST",
+            payload={"event_type": "turn_job", "campaign_id": 10, "actor_discord_user_id": "u1"},
+        )
+        assert created["ok"] is True
+        assert int(created["id"]) == 1
+        listed = _req(f"{base}/db/v1/dead-letters?status=open&limit=5")
+        assert listed["ok"] is True
+        assert len(listed["rows"]) == 1
+        assert listed["rows"][0]["event_type"] == "turn_job"
     finally:
         server.shutdown()
         server.server_close()

@@ -33,6 +33,7 @@ from aigm.db.models import (
     CampaignRule,
     CampaignSnapshot,
     Character,
+    DeadLetterEvent,
     EffectKnowledge,
     EffectObservation,
     DiceRollLog,
@@ -2924,6 +2925,176 @@ class GameService:
         )
         db.commit()
         return True
+
+    @staticmethod
+    def _dead_letter_to_dict(row: DeadLetterEvent) -> dict:
+        return {
+            "id": row.id,
+            "event_type": row.event_type,
+            "status": row.status,
+            "campaign_id": row.campaign_id,
+            "discord_thread_id": row.discord_thread_id,
+            "discord_message_id": row.discord_message_id,
+            "actor_discord_user_id": row.actor_discord_user_id,
+            "actor_display_name": row.actor_display_name,
+            "user_input": row.user_input,
+            "payload": dict(row.payload or {}),
+            "error_message": row.error_message,
+            "attempt_count": row.attempt_count,
+            "max_attempts": row.max_attempts,
+            "created_at": row.created_at.isoformat() if row.created_at else "",
+            "updated_at": row.updated_at.isoformat() if row.updated_at else "",
+            "replayed_at": row.replayed_at.isoformat() if row.replayed_at else "",
+        }
+
+    def enqueue_dead_letter_event(
+        self,
+        db: Session,
+        *,
+        event_type: str,
+        campaign_id: int | None,
+        discord_thread_id: str = "",
+        discord_message_id: str = "",
+        actor_discord_user_id: str = "",
+        actor_display_name: str = "",
+        user_input: str = "",
+        error_message: str = "",
+        payload: dict | None = None,
+        max_attempts: int = 3,
+    ) -> int | None:
+        evt_type = (event_type or "").strip().lower()
+        if not evt_type:
+            return None
+        payload_dict = dict(payload or {})
+        if settings.gameplay_use_db_api:
+            try:
+                out = self.db_api.create_dead_letter_event(
+                    event_type=evt_type,
+                    campaign_id=campaign_id,
+                    discord_thread_id=discord_thread_id,
+                    discord_message_id=discord_message_id,
+                    actor_discord_user_id=actor_discord_user_id,
+                    actor_display_name=actor_display_name,
+                    user_input=user_input,
+                    error_message=error_message,
+                    payload=payload_dict,
+                    max_attempts=max_attempts,
+                )
+                return int(out.get("id", 0) or 0) or None
+            except Exception:
+                pass
+        try:
+            row = DeadLetterEvent(
+                event_type=evt_type,
+                status="open",
+                campaign_id=campaign_id,
+                discord_thread_id=str(discord_thread_id or ""),
+                discord_message_id=str(discord_message_id or ""),
+                actor_discord_user_id=str(actor_discord_user_id or ""),
+                actor_display_name=str(actor_display_name or "")[:128],
+                user_input=str(user_input or ""),
+                payload=payload_dict,
+                error_message=str(error_message or ""),
+                attempt_count=0,
+                max_attempts=max(1, int(max_attempts)),
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            db.add(row)
+            db.commit()
+            return int(row.id)
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return None
+
+    def list_dead_letter_events(self, db: Session, *, status: str = "", limit: int = 50) -> list[dict]:
+        normalized_status = (status or "").strip().lower()
+        clamped_limit = max(1, min(500, int(limit)))
+        if settings.gameplay_use_db_api:
+            try:
+                return self.db_api.list_dead_letter_events(status=normalized_status, limit=clamped_limit)
+            except Exception:
+                pass
+        q = db.query(DeadLetterEvent)
+        if normalized_status:
+            q = q.filter(DeadLetterEvent.status == normalized_status)
+        rows = q.order_by(DeadLetterEvent.id.desc()).limit(clamped_limit).all()
+        return [self._dead_letter_to_dict(row) for row in rows]
+
+    def replay_dead_letter_event(self, db: Session, *, event_id: int) -> tuple[bool, str, dict]:
+        row = db.query(DeadLetterEvent).filter(DeadLetterEvent.id == int(event_id)).one_or_none()
+        if row is None:
+            return False, "Dead-letter event not found.", {}
+        if row.status == "replayed":
+            return False, "Dead-letter event already replayed.", self._dead_letter_to_dict(row)
+        if int(row.attempt_count) >= int(row.max_attempts):
+            row.status = "failed"
+            row.updated_at = datetime.utcnow()
+            db.add(row)
+            db.commit()
+            return False, "Dead-letter event exhausted max replay attempts.", self._dead_letter_to_dict(row)
+
+        row.status = "replaying"
+        row.attempt_count = int(row.attempt_count) + 1
+        row.updated_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+
+        if row.event_type != "turn_job":
+            row.status = "failed"
+            row.error_message = f"Unsupported dead-letter event_type: {row.event_type}"
+            row.updated_at = datetime.utcnow()
+            db.add(row)
+            db.commit()
+            return False, row.error_message, self._dead_letter_to_dict(row)
+
+        campaign = None
+        if row.campaign_id:
+            campaign = db.query(Campaign).filter(Campaign.id == int(row.campaign_id)).one_or_none()
+        if campaign is None and row.discord_thread_id:
+            campaign = db.query(Campaign).filter(Campaign.discord_thread_id == row.discord_thread_id).one_or_none()
+        if campaign is None:
+            row.status = "failed" if int(row.attempt_count) >= int(row.max_attempts) else "open"
+            row.error_message = "Replay failed: campaign not found."
+            row.updated_at = datetime.utcnow()
+            db.add(row)
+            db.commit()
+            return False, row.error_message, self._dead_letter_to_dict(row)
+
+        narration, details = self.process_turn_routed(
+            db,
+            campaign=campaign,
+            actor=row.actor_discord_user_id,
+            actor_display_name=row.actor_display_name,
+            user_input=row.user_input,
+        )
+        rejected = list(details.get("rejected", []) or [])
+        rolled_back = any(str((x or {}).get("reason", "")).strip() == "turn_rolled_back" for x in rejected if isinstance(x, dict))
+        payload = dict(row.payload or {})
+        payload["replay_result"] = {
+            "narration": narration,
+            "rejected": rejected,
+            "accepted": list(details.get("accepted", []) or []),
+            "at": datetime.utcnow().isoformat(),
+        }
+        row.payload = payload
+        row.updated_at = datetime.utcnow()
+        if rolled_back:
+            row.status = "failed" if int(row.attempt_count) >= int(row.max_attempts) else "open"
+            row.error_message = "Replay returned rollback envelope."
+            db.add(row)
+            db.commit()
+            return False, "Replay failed; turn rolled back again.", self._dead_letter_to_dict(row)
+
+        row.status = "replayed"
+        row.error_message = ""
+        row.replayed_at = datetime.utcnow()
+        db.add(row)
+        db.commit()
+        return True, "Dead-letter replay completed.", self._dead_letter_to_dict(row)
 
     def report_player_issue(
         self,

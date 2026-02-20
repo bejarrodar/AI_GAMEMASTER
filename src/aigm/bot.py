@@ -29,6 +29,8 @@ turn_workers_started = False
 class TurnJob:
     channel: discord.abc.Messageable
     campaign_id: int
+    thread_id: str
+    discord_message_id: str
     actor_id: str
     actor_display_name: str
     user_input: str
@@ -62,6 +64,7 @@ def _possible_commands() -> list[str]:
         "!exportcampaign",
         "!importcampaign",
         "!adminrestorecampaign",
+        "!admindlq",
         "!adminauth",
         "!adminlogout",
         "!adminrules",
@@ -90,7 +93,7 @@ def _possible_commands() -> list[str]:
 
 
 def _is_admin_command(cmd_name: str, content: str) -> bool:
-    if cmd_name in {"!adminauth", "!adminlogout", "!adminrules", "!adminrestorecampaign"}:
+    if cmd_name in {"!adminauth", "!adminlogout", "!adminrules", "!adminrestorecampaign", "!admindlq"}:
         return True
     return content.startswith("!adminrule ")
 
@@ -113,6 +116,7 @@ async def _send_gm_help(channel: discord.abc.Messageable) -> None:
         "- `!exportcampaign [scope]`: Create snapshot (`all|state|rules|players|characters|turns`).\n"
         "- `!importcampaign <snapshot_key>`\n"
         "- `!adminrestorecampaign <snapshot_key>` (admin)\n"
+        "- `!admindlq list [status] [limit]` / `!admindlq replay <event_id>` (admin)\n"
         "- `!adminauth <token>` / `!adminlogout`\n"
     )
     await channel.send(help_text[:1900])
@@ -132,6 +136,7 @@ async def _turn_worker() -> None:
                 diagnostics = f"\n\nRejected commands: {len(details['rejected'])}"
             await job.channel.send(f"{narration}{diagnostics}")
         except Exception as exc:  # noqa: BLE001
+            await asyncio.to_thread(_enqueue_dead_letter_sync, job, str(exc), "turn_worker_exception")
             await job.channel.send(f"Turn processing failed: {exc}")
         finally:
             typing_stop.set()
@@ -168,6 +173,23 @@ def _process_turn_sync(job: TurnJob) -> tuple[str, dict]:
             actor=job.actor_id,
             actor_display_name=job.actor_display_name,
             user_input=job.user_input,
+        )
+
+
+def _enqueue_dead_letter_sync(job: TurnJob, error_message: str, source: str) -> None:
+    with SessionLocal() as db:
+        service.enqueue_dead_letter_event(
+            db,
+            event_type="turn_job",
+            campaign_id=int(job.campaign_id),
+            discord_thread_id=str(job.thread_id),
+            discord_message_id=str(job.discord_message_id),
+            actor_discord_user_id=str(job.actor_id),
+            actor_display_name=str(job.actor_display_name),
+            user_input=str(job.user_input),
+            error_message=str(error_message),
+            payload={"source": str(source)},
+            max_attempts=3,
         )
 
 
@@ -313,6 +335,7 @@ async def on_message(message: discord.Message) -> None:
             "!startstory",
             "!importcampaign",
             "!adminrestorecampaign",
+            "!admindlq",
             "!adminauth",
             "!adminlogout",
             "!adminrules",
@@ -395,6 +418,47 @@ async def on_message(message: discord.Message) -> None:
             if ok:
                 service.set_rule(db, campaign, "game_started", "true")
             await message.channel.send(detail if ok else f"Restore failed: {detail}")
+            return
+
+        if content.startswith("!admindlq"):
+            if not is_admin:
+                await message.channel.send("Admin auth required. Use !adminauth <token>")
+                return
+            parts = content.split()
+            if len(parts) == 1 or parts[1].lower() == "list":
+                status = parts[2].strip().lower() if len(parts) >= 3 else ""
+                try:
+                    limit = int(parts[3]) if len(parts) >= 4 else 10
+                except ValueError:
+                    limit = 10
+                rows = service.list_dead_letter_events(db, status=status, limit=limit)
+                if not rows:
+                    await message.channel.send("Dead-letter queue is empty.")
+                    return
+                lines: list[str] = []
+                for row in rows:
+                    lines.append(
+                        f"- id={row['id']} status={row['status']} attempts={row['attempt_count']}/{row['max_attempts']} "
+                        f"type={row['event_type']} actor={row['actor_display_name'] or row['actor_discord_user_id']}"
+                    )
+                await message.channel.send(("Dead-letter events:\n" + "\n".join(lines))[:1900])
+                return
+            if len(parts) >= 3 and parts[1].lower() == "replay":
+                try:
+                    event_id = int(parts[2])
+                except ValueError:
+                    await message.channel.send("Usage: !admindlq replay <event_id>")
+                    return
+                ok, detail, row = service.replay_dead_letter_event(db, event_id=event_id)
+                status = str(row.get("status", "unknown"))
+                attempts = f"{row.get('attempt_count', 0)}/{row.get('max_attempts', 0)}"
+                if ok:
+                    response = f"{detail}\nEvent {event_id}: status={status}, attempts={attempts}"
+                else:
+                    response = f"Replay failed: {detail}\nEvent {event_id}: status={status}, attempts={attempts}"
+                await message.channel.send(response)
+                return
+            await message.channel.send("Usage: !admindlq list [status] [limit] OR !admindlq replay <event_id>")
             return
 
         if content.startswith("!adminrules"):
@@ -719,6 +783,8 @@ async def on_message(message: discord.Message) -> None:
         job = TurnJob(
             channel=message.channel,
             campaign_id=int(campaign.id),
+            thread_id=str(message.channel.id),
+            discord_message_id=str(message.id),
             actor_id=actor_id,
             actor_display_name=message.author.display_name,
             user_input=content,
@@ -726,6 +792,7 @@ async def on_message(message: discord.Message) -> None:
         try:
             turn_job_queue.put_nowait(job)
         except asyncio.QueueFull:
+            _enqueue_dead_letter_sync(job, "turn_worker_queue_full", "turn_queue_full")
             await message.channel.send("Turn queue is currently full. Please retry in a few moments.")
             return
 

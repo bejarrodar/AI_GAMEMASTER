@@ -19,6 +19,7 @@ DEFAULT_REQUIRED_TABLES = (
     "rulebooks",
     "rulebook_entries",
     "dice_roll_logs",
+    "dead_letter_events",
 )
 
 REQUIRED_COLUMNS: dict[str, dict[str, str]] = {

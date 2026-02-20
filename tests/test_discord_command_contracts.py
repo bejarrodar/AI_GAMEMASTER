@@ -91,6 +91,7 @@ def test_possible_commands_contains_expected_surface() -> None:
     assert "!gmhelp" in cmds
     assert "!startgame" in cmds
     assert "!startstory" in cmds
+    assert "!admindlq" in cmds
     assert "!help" not in cmds
 
 
