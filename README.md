@@ -222,6 +222,8 @@ AIGM_DISCORD_RATE_LIMIT_WINDOW_S=10
 AIGM_DISCORD_RATE_LIMIT_MAX_MESSAGES=6
 AIGM_TURN_CONFLICT_RETRIES=1
 AIGM_MANAGEMENT_API_PORT=9541
+AIGM_MANAGEMENT_API_IDEMPOTENCY_TTL_S=3600
+AIGM_MANAGEMENT_API_IDEMPOTENCY_MAX_ENTRIES=2000
 AIGM_DB_API_PORT=9542
 AIGM_DB_API_URL=http://127.0.0.1:9542
 AIGM_DB_API_TOKEN=
@@ -551,6 +553,7 @@ The UI supports:
   - Supervisor also exposes Prometheus-style metrics at `/metrics`.
 - Management API (auth: `Authorization: Bearer <AIGM_SYS_ADMIN_TOKEN>` when configured):
   - `GET /api/v1/meta`
+  - `GET /api/v1/openapi.json`
   - `GET /api/v1/health`
   - `GET|PUT /api/v1/config/llm`
   - `GET|PUT /api/v1/config/web`
@@ -563,6 +566,7 @@ The UI supports:
   - `GET|POST /db/v1/bots`
   - `PUT|DELETE /db/v1/bots/{id}`
   - `GET /db/v1/logs/system`
+  - `POST /db/v1/logs/system/batch`
   - `GET /db/v1/logs/audit`
   - `GET /db/v1/debug/table-counts`
 - System Logs page with filters (`service`, `level`, time window, message search) backed by `system_logs`.
@@ -650,6 +654,9 @@ Each Documentation section is backed by its own markdown file:
 - `docs/GAMEPLAY_KNOWLEDGE.md`
 - `docs/AUTH_AND_ROLES.md`
 - `docs/HEALTH_AND_LOGS.md`
+- `docs/API_CONTRACTS_AND_VERSIONING.md`
+- `docs/LOG_SCHEMA.md`
+- `docs/SLO_SLI_ALERTING.md`
 - `docs/WORLD_MODEL.md`
 - `docs/LONG_HORIZON_MEMORY.md`
 - `docs/MODEL_EVAL.md`
@@ -663,51 +670,61 @@ Each Documentation section is backed by its own markdown file:
 Use this as the active backlog of enhancements and requirements. Remove items from this list as they are implemented.
 
 - [ ] Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
-- [ ] Reliability: define formal SLOs/SLIs (turn latency, success rate, health uptime) with alert routing and on-call escalation docs.
+- [x] Reliability: define formal SLOs/SLIs (turn latency, success rate, health uptime) with alert routing and on-call escalation docs.
 - [ ] Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
-- [ ] Reliability: add circuit breakers around LLM provider failures and queue overload with graceful degradation modes.
+- [x] Reliability: add circuit breakers around LLM provider failures and queue overload with graceful degradation modes.
 - [ ] Reliability: add idempotent message processing keys to prevent duplicate turn application on retries/reconnects.
 - [ ] Reliability: add dead-letter queue + replay tooling for failed Discord events/turn jobs.
-- [ ] Reliability: implement async worker queue for turn processing to isolate Discord event loop from heavy inference paths.
-- [ ] Discord command surface: restore explicit pre-start game lifecycle commands (`!startgame`, `!startstory`) with thread gating.
-- [ ] Discord command surface: restore `!gmhelp` command discovery/help output.
-- [ ] Discord command surface: restore `!ping` health command.
-- [ ] Discord command surface: restore campaign snapshot commands (`!exportcampaign`, `!importcampaign`, `!adminrestorecampaign`).
-- [ ] Discord command surface: restore turn retry command (`!retry`) with state rollback guarantees.
-- [ ] Discord command surface: restore command aliases (`!mycharactor`, `!deletecharacter`, `!deletecharactor`) and `!teach`.
-- [ ] Discord command surface: restore per-campaign engine command (`!agentmode [classic|crew]`).
+- [x] Reliability: implement async worker queue for turn processing to isolate Discord event loop from heavy inference paths.
+- [x] Discord command surface: restore explicit pre-start game lifecycle commands (`!startgame`, `!startstory`) with thread gating.
+- [x] Discord command surface: restore `!gmhelp` command discovery/help output.
+- [x] Discord command surface: restore `!ping` health command.
+- [x] Discord command surface: restore campaign snapshot commands (`!exportcampaign`, `!importcampaign`, `!adminrestorecampaign`).
+- [x] Discord command surface: restore turn retry command (`!retry`) with state rollback guarantees.
+- [x] Discord command surface: restore `!teach` command and LLM-based unknown-command validation/suggestions.
+- [x] Discord command surface: restore per-campaign engine command (`!agentmode [classic|crew]`).
 - [ ] Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
-- [ ] Observability: add distributed correlation IDs across Discord message -> turn -> LLM calls -> DB writes.
-- [ ] Observability: add structured JSON logging baseline and log schemas for all services/scripts.
-- [ ] Observability: add alert rules for stalled turns, repeated fallback usage, and token/latency anomalies.
+- [x] Observability: add distributed correlation IDs across Discord message -> turn -> LLM calls -> DB writes.
+- [x] Observability: add structured JSON logging baseline and log schemas for all services/scripts.
+- [x] Observability: move component log writes to API calls (`management_api`/`db_api`) so all persisted logs flow through versioned endpoints instead of direct DB sessions.
+- [x] Observability: add logging coverage audit + checklist to identify unlogged paths and enforce minimum log events for startup, command handling, API mutations, retries/fallbacks, and failures.
+- [ ] Observability: add multiline error/traceback ingestion contract across all components (preserve single logical error entries end-to-end in DB/UI/API).
+- [x] Observability: add alert rules for stalled turns, repeated fallback usage, and token/latency anomalies.
 - [ ] Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
 - [ ] Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
-- [ ] Security: add rate limits and abuse controls for admin endpoints and dangerous commands.
+- [x] Security: add rate limits and abuse controls for admin endpoints and dangerous commands.
 - [ ] Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
 - [ ] Data governance: add PII redaction controls for logs, prompts, and exports.
 - [ ] Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
 - [x] API/platform: add versioned admin API (health, bots, config, logs, debug checks) for non-UI management.
-- [ ] API/platform: add campaign/gameplay DB API endpoints and migrate `GameService` reads/writes behind a service client.
-- [ ] API/platform: migrate Streamlit pages to use only Management/DB APIs (remove direct `SessionLocal` usage in UI layer).
+- [x] API/platform: add campaign/gameplay DB API endpoints and migrate `GameService` reads/writes behind a service client.
+- [x] API/platform: migrate Streamlit pages to use only Management/DB APIs (remove direct `SessionLocal` usage in UI layer).
 - [ ] API/platform: split supervisor into independently deployable `web`, `bot`, `management_api`, `db_api` service units with explicit inter-service URLs/tokens.
 - [ ] API/platform: expand management API to full users/roles CRUD + permission scope mapping endpoints.
-- [ ] API/platform: add OpenAPI docs for management endpoints and auth scopes.
-- [ ] API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
+- [x] API/platform: add OpenAPI docs for management endpoints and auth scopes.
+- [x] API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
 - [ ] API/platform: add inter-service auth scope separation (distinct tokens/scopes per component, token rotation workflow).
 - [ ] API/platform: add API rate limiting and per-endpoint quotas for management/debug surfaces.
-- [ ] API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
-- [ ] API/platform: add service-to-service retry/circuit-breaker policy with consistent error envelope across APIs.
-- [ ] API/platform: add event/audit correlation IDs propagated across API hops (bot -> management -> db_api).
-- [ ] API/platform: add API integration test suite covering cross-component flows (bot config CRUD -> bot manager reconcile -> health/log visibility).
+- [x] API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
+- [x] API/platform: add service-to-service retry/circuit-breaker policy with consistent error envelope across APIs.
+- [x] API/platform: add event/audit correlation IDs propagated across API hops (bot -> management -> db_api).
+- [x] API/platform: add API integration test suite covering cross-component flows (bot config CRUD -> bot manager reconcile -> health/log visibility).
 - [ ] Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
 - [ ] Multi-bot platform: add per-bot config profiles (models, prompts, rate limits, allowed commands, visibility).
 - [ ] Multi-bot platform: add bot lifecycle management (drain mode, maintenance mode, migration between threads).
-- [ ] State safety: complete command-level transactional guarantees so all mutations are atomic per turn.
+- [x] State safety: complete command-level transactional guarantees so all mutations are atomic per turn.
 - [ ] State safety: add full rewind/replay tooling (per-turn rollback, selective replay, conflict handling).
-- [ ] State safety: add schema validation for all persisted `ai_raw_output` payloads with migration/versioning.
-- [ ] LLM robustness: add response contract tests for intent extraction/review/generation JSON modes across providers.
+- [x] State safety: add schema validation for all persisted `ai_raw_output` payloads with migration/versioning.
+- [x] LLM robustness: add response contract tests for intent extraction/review/generation JSON modes across providers.
 - [ ] LLM robustness: add adaptive fallback routing across local and external LLM providers by latency/quality targets.
 - [ ] LLM robustness: add prompt template versioning with A/B testing and rollback.
+- [x] LLM robustness: replace scene-affordance pickup heuristics with explicit LLM feasibility checks (item availability + rationale + confidence), keeping deterministic fallback only for outage paths.
+- [x] LLM robustness: migrate inventory intent parsing from regex-first to LLM-first (regex only as emergency extractor fallback with no silent state mutation).
+- [x] LLM robustness: replace deterministic object portability classifier with model-provided `object_type`/`portability` + confidence calibration.
+- [ ] LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
+- [x] LLM robustness: replace heuristic purchase/currency checks with ruleset-aware transaction intent extraction (cost, currency, quantity) and explicit validation.
+- [ ] LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
+- [ ] LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
 - [ ] Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
 - [ ] Performance: add response streaming path (Discord typing/partial status updates) for long generations.
 - [ ] Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
@@ -733,6 +750,76 @@ Use this as the active backlog of enhancements and requirements. Remove items fr
 - [ ] Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
 - [ ] Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
 - [ ] Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
+- [ ] Operations: add issue tracking page in Streamlit with triage workflow (status, severity, owner, resolution notes) backed by `!reportissue` and admin-created issues.
+
+### Priority Execution Order
+
+Use this sequence for implementation and validation so the platform remains testable while expanding scope.
+
+#### Immediate Attention (stability + correctness first)
+
+1. Observability: add multiline error/traceback ingestion contract across all components (preserve single logical error entries end-to-end in DB/UI/API).
+2. Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
+
+#### Basic Testing Readiness (production-like validation baseline)
+
+1. Reliability: define formal SLOs/SLIs (turn latency, success rate, health uptime) with alert routing and on-call escalation docs.
+2. Observability: add structured JSON logging baseline and log schemas for all services/scripts.
+3. Observability: move component log writes to API calls (`management_api`/`db_api`) so all persisted logs flow through versioned endpoints instead of direct DB sessions.
+4. Observability: add alert rules for stalled turns, repeated fallback usage, and token/latency anomalies.
+5. API/platform: publish API schemas/version contracts (request/response) and add backward-compatibility policy.
+6. API/platform: add OpenAPI docs for management endpoints and auth scopes.
+7. API/platform: add API idempotency keys for mutating endpoints (`POST`/`PUT`/`DELETE`) where retries are expected.
+8. Testing/quality: add contract tests for Discord command parsing, help suggestions, and unknown-command intent mapping.
+9. Testing/quality: add snapshot regression tests for narration quality across critical scenarios.
+10. Reliability: add automated chaos tests for DB outage, Ollama outage, and slow LLM responses.
+11. Testing/quality: add nightly soak tests with long-running simulated campaigns and memory growth checks.
+12. Operations: add one-command diagnostics bundle script for support incidents (config, health, logs, metrics, recent errors).
+
+#### Nice-to-Have (scale, UX, and expansion)
+
+1. API/platform: split supervisor into independently deployable `web`, `bot`, `management_api`, `db_api` service units with explicit inter-service URLs/tokens.
+2. API/platform: expand management API to full users/roles CRUD + permission scope mapping endpoints.
+3. API/platform: add inter-service auth scope separation (distinct tokens/scopes per component, token rotation workflow).
+4. API/platform: add API rate limiting and per-endpoint quotas for management/debug surfaces.
+5. Multi-bot platform: add per-bot config profiles (models, prompts, rate limits, allowed commands, visibility).
+6. Multi-bot platform: add bot lifecycle management (drain mode, maintenance mode, migration between threads).
+7. State safety: add full rewind/replay tooling (per-turn rollback, selective replay, conflict handling).
+8. LLM robustness: add adaptive fallback routing across local and external LLM providers by latency/quality targets.
+9. LLM robustness: add prompt template versioning with A/B testing and rollback.
+10. LLM robustness: migrate self-query trigger detection (`appearance`/`equipped`) to intent classification while preserving deterministic answers from saved state/inventory.
+11. LLM robustness: shift relevance-learning fallback extraction to intent-native `relevance_signals` as primary source.
+12. LLM robustness: keep string-similarity command inference as last-resort fallback only; enforce confidence thresholds on LLM command suggestion.
+13. Performance: add token budgeting/enforcement with hard caps and context truncation diagnostics.
+14. Performance: add response streaming path (Discord typing/partial status updates) for long generations.
+15. Performance: add benchmark suite for end-to-end throughput by mode (`dnd`, `story`, `crew`).
+16. Gameplay systems: expand dice engine beyond current baseline (contested rolls, saved roll presets, richer roll expression grammar, GM-forced rolls).
+17. Gameplay systems: expand configurable ruleset packs beyond current baseline (additional systems/editions, deeper mechanics metadata, compatibility layers).
+18. Gameplay systems: add initiative/order/combat toolkit and encounter state tracking.
+19. Gameplay systems: add economy subsystem (currency validation, pricing tables, purchase checks).
+20. Knowledge systems: expand rulebook ingestion pipeline with stronger provenance/citation enforcement and bulk import tooling.
+21. Knowledge systems: expand retrieval/ranking with confidence scoring and citation quality controls.
+22. Knowledge systems: add approval workflow + provenance history for custom lore/books authoring.
+23. Knowledge systems: add world encyclopedia entities (items, factions, locations, spells, effects) with admin curation.
+24. GM profiles: add selectable GM styles (genre + personality presets) and per-campaign style overrides.
+25. GM profiles: add safety/style guardrails per profile (tone bounds, violence bounds, forbidden content).
+26. UX/theming: add theme manager (icons, palettes, typography, layout presets) with user-level preferences.
+27. UX/theming: add campaign presentation skins (fantasy/sci-fi/horror) and visual assets mapping.
+28. UX/theming: add accessibility pass (contrast, keyboard nav, reduced motion, screen-reader labels).
+29. Collaboration: add concurrent speaker handling policy (message ordering windows, simultaneous action resolution).
+30. Collaboration: add GM moderation tools (pause/resume thread, soft-delete turn, annotate rulings).
+31. Import/export: add granular export/import scopes (characters, rules, inventory, world, logs, memories, bots).
+32. Import/export: add signed/verified backup bundles for secure transfer between threads/servers.
+33. Cost control: add token/cost dashboards and per-campaign quotas with admin override workflows.
+34. Operations: add issue tracking page in Streamlit with triage workflow (status, severity, owner, resolution notes) backed by `!reportissue` and admin-created issues.
+35. Security: add MFA/SSO options for Streamlit admin accounts and session timeout/lockout policies.
+36. Security: add audit review tools (search/export/signing) for `admin_audit_logs`.
+37. Security: add encryption-at-rest guidance and key-rotation runbook for backups/secrets.
+38. Data governance: add PII redaction controls for logs, prompts, and exports.
+39. Data governance: add retention policies for turn logs, audit logs, system logs, and memory summaries.
+40. Reliability: add periodic disaster-recovery drill automation (restore rehearsal + verification reports).
+41. Release engineering: add blue/green deployment and rollback automation for bot/supervisor releases.
+42. Multi-tenant readiness: define tenant boundaries and row-level isolation strategy for shared deployments.
 
 Already implemented:
 
@@ -744,15 +831,42 @@ Already implemented:
 - Alembic migration scaffolding is included (`alembic.ini`, `alembic/`, `src/aigm/db/migrate.py`) with optional startup usage via `AIGM_DATABASE_USE_ALEMBIC=true`.
 - Health API now exposes Prometheus-style metrics on `/metrics`.
 - Management API is implemented and versioned (`/api/v1/*`) for config, bot management, logs, and debug checks.
+- Management API now publishes OpenAPI docs at `/api/v1/openapi.json` with auth scope mapping.
+- API contract/versioning and backward-compatibility policy are documented in `docs/API_CONTRACTS_AND_VERSIONING.md`.
+- Management API mutation idempotency keys are supported for retry-safe `POST`/`PUT`/`DELETE` flows.
+- DB API client now applies retry/backoff + circuit-breaker policy for service-to-service calls (`AIGM_SERVICE_API_HTTP_*`, `AIGM_SERVICE_API_CIRCUIT_BREAKER_*`) and uses a consistent API error envelope (`error_code`, `error_message`, `error_details`) across Management/DB APIs.
+- Correlation IDs are now propagated across Management API -> DB API hops (`X-Correlation-ID`) and echoed in responses/errors for end-to-end traceability.
 - Dedicated DB API is implemented and versioned (`/db/v1/*`) for DB-backed bot config/log access and DB diagnostics.
 - Bot manager now uses DB API for bot config reads (API call boundary instead of direct DB session).
 - Management API now uses DB API for bot config CRUD/log queries and DB health checks.
+- Gameplay DB API endpoints now include campaign-by-thread, campaign-rule read/write, and idempotency reservation surfaces (`/db/v1/campaigns/*`, `/db/v1/idempotency/reserve`), with `GameService` client-backed usage when enabled (`AIGM_GAMEPLAY_USE_DB_API=true`).
+- Duplicate message/turn application guard is enforced via `ProcessedDiscordMessage` idempotency reservation in Discord turn flow.
+- DB API now includes campaign-by-id, global item/effect knowledge/relevance, and dice-roll read surfaces (`/db/v1/campaigns/by-id`, `/db/v1/knowledge/*`, `/db/v1/dice-rolls`).
+- Turn routing now applies explicit rollback envelopes on failure (`source=turn_rollback`) and writes rollback diagnostics to `turn_logs` while returning a safe retry message.
+- Command-level transactional envelopes are in place for turn processing, including rollback diagnostics in persisted turn logs.
+- Management API now includes auth user/role/permission endpoints and agency-rule + crew-turn endpoints used by Streamlit admin surfaces.
+- API integration tests cover cross-component DB API <-> Management API flows (bot CRUD, log visibility, health checks).
+- `ai_raw_output` payloads now pass versioned schema normalization/validation on serialize/deserialize with legacy migration to the current schema version.
+- LLM contract tests now validate intent extraction, generation, and review JSON envelopes across both Ollama and OpenAI adapter paths.
+- Intent extraction is now LLM-first with regex intent enrichment limited to emergency fallback mode only.
+- Runtime portability gating now uses model-provided feasibility metadata (and explicit feasibility calls when missing) rather than deterministic classifier overrides.
+- Purchase/currency validation now relies on intent transaction metadata (`requires_payment`, `cost_amount`, `currency`, `has_required_funds`) instead of regex/currency heuristics.
+- Pickup feasibility no longer uses scene-affordance heuristics; uncertain pickup intents now trigger explicit feasibility assessment (LLM-first, deterministic fallback only on model/provider outage).
 - Component-local configuration store exists for standalone component wiring (`AIGM_COMPONENT_STATE_DIR`).
 - Supervisor now runs DB API as a separate subprocess component and monitors it in health/process checks.
 - DB-only installer entrypoints are available for separated local DB deployments (`scripts/install_db_stack.sh`, `scripts/install_db_stack.ps1`).
 - Supervisor health alerts are configurable (`AIGM_HEALTH_LOG_INTERVAL_S`, `AIGM_HEALTH_ALERT_CONSECUTIVE_FAILURES`).
 - Supervisor can send health alerts to webhook endpoints (`AIGM_HEALTH_ALERT_WEBHOOK_URL`, `AIGM_HEALTH_ALERT_WEBHOOK_COOLDOWN_S`).
+- Supervisor runtime alerts are available for stalled turns, fallback spikes, and latency anomalies (`AIGM_ALERT_*` settings).
 - Turn success/failure counters and latency sums are exported on `/metrics` (plus log queue depth gauge).
+- Streamlit UI now uses Management/DB APIs for campaign/gameplay/auth/admin operations without direct `SessionLocal` DB access in the UI layer.
+- Management API now includes rate limits for read and mutation paths (`AIGM_MANAGEMENT_API_RATE_LIMIT_*`).
+- Discord turn handling now uses a bounded async worker queue (`AIGM_TURN_WORKER_QUEUE_MAX`, `AIGM_TURN_WORKER_COUNT`) with graceful queue-full responses.
+- LLM provider circuit-breaker safeguards are implemented (`AIGM_LLM_CIRCUIT_BREAKER_FAILURE_THRESHOLD`, `AIGM_LLM_CIRCUIT_BREAKER_RESET_S`).
+- Logging coverage checklist documentation is available at `docs/LOGGING_COVERAGE_CHECKLIST.md`.
+- Structured logging schema baseline is documented at `docs/LOG_SCHEMA.md` (`aigm.log.v1`).
+- Baseline SLO/SLI and alert routing targets are documented at `docs/SLO_SLI_ALERTING.md`.
+- Supervisor system-log persistence now uses DB API ingestion (`POST /db/v1/logs/system/batch`) instead of direct DB sessions.
 - Turn conflict retries are configurable (`AIGM_TURN_CONFLICT_RETRIES`).
 - Secret file loading is supported for key credentials (`*_FILE` variables).
 - External secret sources are supported (`json_file`, `command`, `aws_secrets_manager`).

@@ -4,25 +4,30 @@ import argparse
 import json
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from uuid import uuid4
 from urllib import request
 from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy import text
 
+from aigm.adapters.llm import LLMAdapter
 from aigm.config import settings
-from aigm.db.models import AdminAuditLog, SystemLog
+from aigm.db.models import AdminAuditLog, AuthPermission, AuthRole, AuthRolePermission, Campaign
 from aigm.db.session import SessionLocal
 from aigm.ops.component_store import ComponentStore
 from aigm.ops.db_api_client import DBApiClient
+from aigm.services.game_service import GameService
 
 try:
     from openai import OpenAI
@@ -65,6 +70,32 @@ def parse_aigm_metric_line(line: str) -> dict | None:
         k, v = token.split("=", 1)
         fields[k.strip()] = v.strip()
     return {"name": name, "fields": fields}
+
+
+_TRACEBACK_SUMMARY_RE = re.compile(r"^[A-Za-z_][\w.]*:\s+.+$")
+
+
+def is_traceback_start(line: str) -> bool:
+    return (line or "").startswith("Traceback (most recent call last):")
+
+
+def is_traceback_line(line: str) -> bool:
+    text = line or ""
+    if not text:
+        return True
+    if is_traceback_start(text):
+        return True
+    if text.startswith("  File "):
+        return True
+    if text.startswith("    "):
+        return True
+    if text.startswith("During handling of the above exception"):
+        return True
+    if text.startswith("The above exception was the direct cause"):
+        return True
+    if _TRACEBACK_SUMMARY_RE.match(text):
+        return True
+    return False
 
 
 def post_json_webhook(url: str, payload: dict, timeout_s: int = 8) -> None:
@@ -140,6 +171,11 @@ class UnifiedLogger:
         self._backup_count = max(1, int(settings.log_file_backup_count))
         self._batch_size = max(1, int(settings.log_db_batch_size))
         self._flush_interval_s = max(1, int(settings.log_db_flush_interval_s))
+        self._db_api_client: DBApiClient | None = None
+
+    def set_db_api_client(self, client: DBApiClient) -> None:
+        with self._lock:
+            self._db_api_client = client
 
     def _rotate_if_needed(self, path: Path) -> None:
         if not path.exists():
@@ -165,33 +201,24 @@ class UnifiedLogger:
         if not self._db_pending:
             self._last_flush = now
             return
+        if self._db_api_client is None:
+            # DB API not ready yet; keep queue buffered.
+            return
         if not force and len(self._db_pending) < self._batch_size and (now - self._last_flush) < self._flush_interval_s:
             return
         batch = self._db_pending
         self._db_pending = []
-        self._last_flush = now
         try:
-            with SessionLocal() as db:
-                db.add_all(
-                    [
-                        SystemLog(
-                            service=item["service"],
-                            level=item["level"],
-                            message=item["message"],
-                            source=item["source"],
-                            log_metadata=item["metadata"],
-                        )
-                        for item in batch
-                    ]
-                )
-                db.commit()
+            _ = self._db_api_client.ingest_system_logs(batch)
+            self._last_flush = now
         except Exception:
-            # DB logging should never crash supervisor.
-            pass
+            # Keep logs in queue for retry; DB logging should never crash supervisor.
+            self._db_pending = batch + self._db_pending
 
     def write(self, service: str, level: str, message: str, source: str = "runtime", metadata: dict | None = None) -> None:
         # Emit one normalized JSON line to both filesystem sinks and DB sink.
         payload = {
+            "schema_version": "aigm.log.v1",
             "ts": utc_now_iso(),
             "service": service,
             "level": level,
@@ -214,6 +241,123 @@ class UnifiedLogger:
     def flush(self, force: bool = False) -> None:
         with self._lock:
             self._flush_db_locked(force=force)
+
+
+class APIRateLimiter:
+    def __init__(self, window_s: int, max_requests: int) -> None:
+        self.window_s = max(1, int(window_s))
+        self.max_requests = max(1, int(max_requests))
+        self._lock = threading.Lock()
+        self._buckets: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        now = time.time()
+        cutoff = now - float(self.window_s)
+        bucket_key = key.strip() or "unknown"
+        with self._lock:
+            bucket = self._buckets.get(bucket_key, [])
+            bucket = [x for x in bucket if x >= cutoff]
+            if len(bucket) >= self.max_requests:
+                self._buckets[bucket_key] = bucket
+                return False
+            bucket.append(now)
+            self._buckets[bucket_key] = bucket
+            return True
+
+
+class RuntimeAlertMonitor:
+    def __init__(self) -> None:
+        self._fallback_events: deque[float] = deque()
+        self._latency_events: deque[tuple[float, float]] = deque()
+        self._last_turn_metric_ts = time.time()
+        self._last_emitted_by_type: dict[str, float] = {}
+
+    @staticmethod
+    def _is_fallback_line(line: str) -> bool:
+        text = (line or "").lower()
+        return "[llmadapter]" in text and "using fallback" in text
+
+    def observe_line(self, line: str) -> None:
+        if self._is_fallback_line(line):
+            self._fallback_events.append(time.time())
+
+    def observe_metric(self, metric_name: str, fields: dict[str, str] | None = None) -> None:
+        self._last_turn_metric_ts = time.time()
+        data = fields or {}
+        if metric_name != "turn_success":
+            return
+        try:
+            latency_ms = float(data.get("latency_ms", "0") or "0")
+        except ValueError:
+            latency_ms = 0.0
+        if latency_ms > 0:
+            self._latency_events.append((time.time(), latency_ms))
+
+    def evaluate(self, *, queue_depth: int) -> list[dict]:
+        now = time.time()
+        alerts: list[dict] = []
+
+        fallback_window = max(30, int(settings.alert_fallback_window_s))
+        fallback_threshold = max(1, int(settings.alert_fallback_threshold))
+        while self._fallback_events and (now - self._fallback_events[0]) > fallback_window:
+            self._fallback_events.popleft()
+        fallback_count = len(self._fallback_events)
+        if fallback_count >= fallback_threshold:
+            alerts.append(
+                {
+                    "type": "fallback_spike",
+                    "detail": {
+                        "fallback_count": fallback_count,
+                        "window_s": fallback_window,
+                        "threshold": fallback_threshold,
+                    },
+                }
+            )
+
+        latency_window = max(30, int(settings.alert_latency_window_s))
+        latency_threshold_ms = max(1, int(settings.alert_latency_threshold_ms))
+        latency_breach_count = max(1, int(settings.alert_latency_breach_count))
+        while self._latency_events and (now - self._latency_events[0][0]) > latency_window:
+            self._latency_events.popleft()
+        breaches = [v for (_ts, v) in self._latency_events if float(v) >= float(latency_threshold_ms)]
+        if len(breaches) >= latency_breach_count:
+            alerts.append(
+                {
+                    "type": "latency_anomaly",
+                    "detail": {
+                        "breach_count": len(breaches),
+                        "window_s": latency_window,
+                        "threshold_ms": latency_threshold_ms,
+                        "required_breaches": latency_breach_count,
+                        "max_observed_ms": max(breaches) if breaches else 0,
+                    },
+                }
+            )
+
+        stall_s = max(10, int(settings.alert_turn_stall_s))
+        min_queue_depth = max(1, int(settings.alert_turn_stall_queue_depth))
+        if int(queue_depth) >= min_queue_depth and (now - self._last_turn_metric_ts) >= stall_s:
+            alerts.append(
+                {
+                    "type": "turn_stalled",
+                    "detail": {
+                        "queue_depth": int(queue_depth),
+                        "min_queue_depth": min_queue_depth,
+                        "stall_seconds": int(now - self._last_turn_metric_ts),
+                        "threshold_s": stall_s,
+                    },
+                }
+            )
+        return alerts
+
+    def should_emit(self, alert_type: str) -> bool:
+        cooldown_s = max(5, int(settings.alert_runtime_cooldown_s))
+        now = time.time()
+        last = float(self._last_emitted_by_type.get(alert_type, 0.0) or 0.0)
+        if (now - last) < cooldown_s:
+            return False
+        self._last_emitted_by_type[alert_type] = now
+        return True
 
 
 class HealthState:
@@ -439,6 +583,17 @@ class ManagementState:
         self.db_api = DBApiClient(base_url=db_api_url, token=db_api_token, timeout_s=12)
         self.store.set("db_api_url", db_api_url)
         self.store.set("db_api_token", db_api_token)
+        self.game_service = GameService(LLMAdapter())
+        self.request_limiter = APIRateLimiter(
+            window_s=settings.management_api_rate_limit_window_s,
+            max_requests=settings.management_api_rate_limit_max_requests,
+        )
+        self.mutation_limiter = APIRateLimiter(
+            window_s=settings.management_api_mutation_rate_limit_window_s,
+            max_requests=settings.management_api_mutation_rate_limit_max_requests,
+        )
+        self._idempotency_lock = threading.Lock()
+        self._idempotency_cache: dict[str, dict] = {}
 
     def auth_ok(self, authorization: str) -> bool:
         token = self.api_token.strip()
@@ -625,6 +780,219 @@ class ManagementState:
     def get_audit_logs(self, *, limit: int) -> list[dict]:
         return self.db_api.list_audit_logs(limit=limit)
 
+    def list_agency_rules(self) -> list[dict]:
+        with SessionLocal() as db:
+            rows = self.game_service.admin_list_rule_blocks(db)
+            return [
+                {
+                    "rule_id": r.rule_id,
+                    "title": r.title,
+                    "priority": r.priority,
+                    "body": r.body,
+                    "is_enabled": bool(r.is_enabled),
+                    "updated_at": r.updated_at.isoformat() if r.updated_at else None,
+                }
+                for r in rows
+            ]
+
+    def upsert_agency_rule(self, payload: dict) -> tuple[bool, str]:
+        rule_id = str(payload.get("rule_id", "")).strip()
+        title = str(payload.get("title", "")).strip()
+        priority = str(payload.get("priority", "high")).strip().lower()
+        body = str(payload.get("body", "")).strip()
+        if not rule_id or not title or not body:
+            return False, "rule_id, title, and body are required."
+        if priority not in {"critical", "high", "medium", "low"}:
+            return False, "priority must be one of: critical, high, medium, low."
+        with SessionLocal() as db:
+            self.game_service.admin_upsert_rule_block(
+                db,
+                rule_id=rule_id,
+                title=title,
+                priority=priority,
+                body=body,
+            )
+        self._audit("agency_rule_upserted", {"rule_id": rule_id, "priority": priority})
+        return True, "Upserted."
+
+    def remove_agency_rule(self, rule_id: str) -> tuple[bool, str]:
+        rid = (rule_id or "").strip()
+        if not rid:
+            return False, "rule_id is required."
+        with SessionLocal() as db:
+            ok = self.game_service.admin_remove_rule_block(db, rid)
+        if ok:
+            self._audit("agency_rule_removed", {"rule_id": rid})
+            return True, "Removed."
+        return False, "Rule not found."
+
+    def set_agency_rule_enabled(self, rule_id: str, is_enabled: bool) -> tuple[bool, str]:
+        rid = (rule_id or "").strip()
+        if not rid:
+            return False, "rule_id is required."
+        with SessionLocal() as db:
+            ok = self.game_service.admin_set_rule_block_enabled(db, rid, bool(is_enabled))
+        if ok:
+            self._audit("agency_rule_toggled", {"rule_id": rid, "enabled": bool(is_enabled)})
+            return True, "Updated."
+        return False, "Rule not found."
+
+    def _get_campaign_for_api(self, db, campaign_id: int) -> Campaign:
+        campaign = db.query(Campaign).filter(Campaign.id == int(campaign_id)).one_or_none()
+        if campaign is None:
+            raise ValueError("campaign not found")
+        return campaign
+
+    def crew_preview(self, campaign_id: int, payload: dict) -> dict:
+        actor = str(payload.get("actor", "")).strip()
+        user_input = str(payload.get("user_input", "")).strip()
+        crew_definition_json = str(payload.get("crew_definition_json", "")).strip()
+        if not actor or not user_input:
+            raise ValueError("actor and user_input are required")
+        with SessionLocal() as db:
+            campaign = self._get_campaign_for_api(db, int(campaign_id))
+            preview = self.game_service.preview_turn_with_crew(
+                db,
+                campaign=campaign,
+                actor=actor,
+                user_input=user_input,
+                crew_definition_json=crew_definition_json,
+            )
+        return preview
+
+    def crew_apply(self, campaign_id: int, payload: dict) -> dict:
+        actor = str(payload.get("actor", "")).strip()
+        actor_display_name = str(payload.get("actor_display_name", "")).strip() or actor
+        user_input = str(payload.get("user_input", "")).strip()
+        crew_definition_json = str(payload.get("crew_definition_json", "")).strip()
+        if not actor or not user_input:
+            raise ValueError("actor and user_input are required")
+        with SessionLocal() as db:
+            campaign = self._get_campaign_for_api(db, int(campaign_id))
+            narration, details = self.game_service.process_turn_with_crew(
+                db,
+                campaign=campaign,
+                actor=actor,
+                actor_display_name=actor_display_name,
+                user_input=user_input,
+                crew_definition_json=crew_definition_json,
+            )
+        self._audit("crew_turn_applied", {"campaign_id": int(campaign_id), "actor": actor})
+        return {"narration": narration, "details": details}
+
+    def list_auth_users(self) -> list[dict]:
+        with SessionLocal() as db:
+            return self.game_service.auth_list_users(db)
+
+    def list_auth_roles(self) -> list[dict]:
+        with SessionLocal() as db:
+            roles = db.query(AuthRole).order_by(AuthRole.name.asc()).all()
+            perms = db.query(AuthPermission).all()
+            perm_map = {p.id: p.name for p in perms}
+            links = db.query(AuthRolePermission).all()
+            perms_by_role: dict[int, list[str]] = {}
+            for link in links:
+                name = perm_map.get(link.permission_id)
+                if not name:
+                    continue
+                perms_by_role.setdefault(link.role_id, []).append(name)
+            return [
+                {
+                    "id": r.id,
+                    "name": r.name,
+                    "description": r.description,
+                    "permissions": sorted(perms_by_role.get(r.id, [])),
+                }
+                for r in roles
+            ]
+
+    def list_auth_permissions(self) -> list[dict]:
+        with SessionLocal() as db:
+            rows = db.query(AuthPermission).order_by(AuthPermission.name.asc()).all()
+            return [{"id": p.id, "name": p.name, "description": p.description} for p in rows]
+
+    def create_auth_user(self, payload: dict) -> tuple[bool, str]:
+        username = str(payload.get("username", "")).strip()
+        password = str(payload.get("password", ""))
+        display_name = str(payload.get("display_name", "")).strip()
+        roles = payload.get("roles", [])
+        with SessionLocal() as db:
+            ok, msg = self.game_service.auth_create_user(
+                db,
+                username=username,
+                password=password,
+                display_name=display_name,
+                roles=[str(x).strip() for x in roles if str(x).strip()] or ["player"],
+            )
+            if ok:
+                self._audit("auth_user_created", {"username": username})
+            return ok, msg
+
+    def assign_auth_role(self, username: str, role_name: str) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            ok, msg = self.game_service.auth_assign_role(db, username.strip(), role_name.strip())
+            if ok:
+                self._audit("auth_role_assigned", {"username": username.strip(), "role": role_name.strip()})
+            return ok, msg
+
+    def set_auth_password(self, username: str, new_password: str) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            ok, msg = self.game_service.auth_set_user_password(db, username.strip(), new_password)
+            if ok:
+                self._audit("auth_password_reset", {"username": username.strip()})
+            return ok, msg
+
+    def link_auth_discord(self, username: str, discord_user_id: str) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            ok, msg = self.game_service.auth_link_discord_user(db, username.strip(), discord_user_id.strip())
+            if ok:
+                self._audit(
+                    "auth_discord_linked",
+                    {"username": username.strip(), "discord_user_id": discord_user_id.strip()},
+                )
+            return ok, msg
+
+    def create_auth_role(self, payload: dict) -> tuple[bool, str]:
+        role_name = str(payload.get("name", "")).strip().lower()
+        description = str(payload.get("description", "")).strip()
+        desired_perm_names = [str(x).strip() for x in (payload.get("permissions") or []) if str(x).strip()]
+        if not role_name:
+            return False, "Role name is required."
+        with SessionLocal() as db:
+            if db.query(AuthRole).filter(AuthRole.name == role_name).one_or_none():
+                return False, "Role already exists."
+            role = AuthRole(name=role_name, description=description)
+            db.add(role)
+            db.flush()
+            if desired_perm_names:
+                perms = db.query(AuthPermission).filter(AuthPermission.name.in_(set(desired_perm_names))).all()
+                for perm in perms:
+                    db.add(AuthRolePermission(role_id=role.id, permission_id=perm.id))
+            db.commit()
+            self._audit("auth_role_created", {"role": role_name, "permissions": desired_perm_names})
+        return True, "Role created."
+
+    def update_auth_role_permissions(self, role_name: str, permissions: list[str]) -> tuple[bool, str]:
+        role_name = role_name.strip().lower()
+        desired = {str(x).strip() for x in permissions if str(x).strip()}
+        with SessionLocal() as db:
+            role = db.query(AuthRole).filter(AuthRole.name == role_name).one_or_none()
+            if not role:
+                return False, "Role not found."
+            perm_rows = db.query(AuthPermission).all()
+            perm_ids_by_name = {p.name: p.id for p in perm_rows}
+            desired_ids = {perm_ids_by_name[name] for name in desired if name in perm_ids_by_name}
+            existing_links = db.query(AuthRolePermission).filter(AuthRolePermission.role_id == role.id).all()
+            existing_ids = {x.permission_id for x in existing_links}
+            for perm_id in desired_ids - existing_ids:
+                db.add(AuthRolePermission(role_id=role.id, permission_id=perm_id))
+            for link in existing_links:
+                if link.permission_id not in desired_ids:
+                    db.delete(link)
+            db.commit()
+            self._audit("auth_role_permissions_updated", {"role": role_name, "permissions": sorted(desired)})
+            return True, "Role permissions updated."
+
     def check_db(self) -> tuple[bool, str]:
         try:
             payload = self.db_api.health()
@@ -660,16 +1028,375 @@ class ManagementState:
         except Exception as exc:  # noqa: BLE001
             return False, str(exc)
 
+    def list_campaigns(self, limit: int = 500) -> list[dict]:
+        return self.db_api.list_campaigns(limit=max(1, min(1000, int(limit))))
+
+    def get_campaign(self, campaign_id: int) -> dict | None:
+        return self.db_api.campaign_by_id(int(campaign_id))
+
+    def get_campaign_rules(self, campaign_id: int) -> dict[str, str]:
+        return self.db_api.campaign_rules(int(campaign_id))
+
+    def set_campaign_rule(self, campaign_id: int, key: str, value: str) -> dict:
+        row = self.db_api.set_campaign_rule(int(campaign_id), key.strip(), value)
+        self._audit("campaign_rule_saved", {"campaign_id": int(campaign_id), "rule_key": key.strip()})
+        return row
+
+    def list_campaign_turns(self, campaign_id: int, limit: int = 50) -> list[dict]:
+        return self.db_api.list_turn_logs(campaign_id=int(campaign_id), limit=max(1, min(500, int(limit))))
+
+    def list_rulesets(self, enabled_only: bool = False) -> list[dict]:
+        with SessionLocal() as db:
+            rows = self.game_service.list_game_rulesets(db, enabled_only=bool(enabled_only))
+            return [
+                {
+                    "key": r.key,
+                    "name": r.name,
+                    "system": r.system,
+                    "version": r.version,
+                    "summary": r.summary,
+                    "is_official": bool(r.is_official),
+                    "is_enabled": bool(r.is_enabled),
+                    "rules_json": r.rules_json or {},
+                }
+                for r in rows
+            ]
+
+    def upsert_ruleset(self, payload: dict) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            return self.game_service.upsert_game_ruleset(
+                db,
+                key=str(payload.get("key", "")),
+                name=str(payload.get("name", "")),
+                system=str(payload.get("system", "dnd")),
+                version=str(payload.get("version", "")),
+                summary=str(payload.get("summary", "")),
+                is_official=bool(payload.get("is_official", False)),
+                is_enabled=bool(payload.get("is_enabled", True)),
+                rules_json=dict(payload.get("rules_json", {}) or {}),
+            )
+
+    def list_rulebooks(self, enabled_only: bool = False) -> list[dict]:
+        with SessionLocal() as db:
+            rows = self.game_service.list_rulebooks(db, enabled_only=bool(enabled_only))
+            return [
+                {
+                    "slug": r.slug,
+                    "title": r.title,
+                    "system": r.system,
+                    "version": r.version,
+                    "source": r.source,
+                    "summary": r.summary,
+                    "is_enabled": bool(r.is_enabled),
+                }
+                for r in rows
+            ]
+
+    def upsert_rulebook(self, payload: dict) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            return self.game_service.upsert_rulebook(
+                db,
+                slug=str(payload.get("slug", "")),
+                title=str(payload.get("title", "")),
+                system=str(payload.get("system", "dnd")),
+                version=str(payload.get("version", "")),
+                source=str(payload.get("source", "")),
+                summary=str(payload.get("summary", "")),
+                is_enabled=bool(payload.get("is_enabled", True)),
+            )
+
+    def upsert_rulebook_entry(self, payload: dict) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            return self.game_service.upsert_rulebook_entry(
+                db,
+                rulebook_slug=str(payload.get("rulebook_slug", "")),
+                entry_key=str(payload.get("entry_key", "")),
+                title=str(payload.get("title", "")),
+                section=str(payload.get("section", "")),
+                page_ref=str(payload.get("page_ref", "")),
+                tags=[str(x).strip() for x in (payload.get("tags") or []) if str(x).strip()],
+                content=str(payload.get("content", "")),
+            )
+
+    def search_rulebook_entries(self, query: str, limit: int = 6) -> list[dict]:
+        with SessionLocal() as db:
+            return self.game_service.search_rulebook_entries(db, query=query, limit=max(1, min(20, int(limit))))
+
+    def get_campaign_ruleset(self, campaign_id: int) -> dict | None:
+        with SessionLocal() as db:
+            campaign = self._get_campaign_for_api(db, int(campaign_id))
+            row = self.game_service.get_campaign_ruleset(db, campaign)
+            if not row:
+                return None
+            return {
+                "key": row.key,
+                "name": row.name,
+                "system": row.system,
+                "version": row.version,
+                "summary": row.summary,
+                "is_official": bool(row.is_official),
+                "is_enabled": bool(row.is_enabled),
+            }
+
+    def set_campaign_ruleset(self, campaign_id: int, ruleset_key: str) -> tuple[bool, str]:
+        with SessionLocal() as db:
+            campaign = self._get_campaign_for_api(db, int(campaign_id))
+            ok, detail = self.game_service.set_campaign_ruleset(db, campaign, ruleset_key)
+            if ok:
+                self._audit("campaign_ruleset_set", {"campaign_id": int(campaign_id), "ruleset": detail})
+            return ok, detail
+
+    def roll_dice(self, expression: str) -> tuple[bool, dict]:
+        return self.game_service.roll_dice(expression)
+
+    def auth_login(self, username: str, password: str) -> dict:
+        with SessionLocal() as db:
+            user = self.game_service.auth_authenticate_user(db, username.strip(), password)
+            if not user:
+                return {"ok": False, "message": "Invalid credentials."}
+            roles = {
+                str(x.role.name)
+                for x in getattr(user, "roles", [])
+                if getattr(x, "role", None) is not None and str(getattr(x.role, "name", "")).strip()
+            }
+            permissions = sorted(
+                p.name
+                for p in db.query(AuthPermission).all()
+                if self.game_service.auth_user_has_permission(db, int(user.id), p.name)
+            )
+            return {
+                "ok": True,
+                "user": {
+                    "id": int(user.id),
+                    "username": user.username,
+                    "display_name": user.display_name,
+                    "is_active": bool(user.is_active),
+                    "roles": sorted(roles),
+                    "permissions": permissions,
+                },
+            }
+
+    def idempotency_get(self, *, method: str, path: str, key: str, fingerprint: str) -> tuple[int, dict] | None:
+        ttl_s = max(1, int(settings.management_api_idempotency_ttl_s))
+        cache_key = f"{method.upper()}|{path}|{key.strip()}"
+        now = time.time()
+        with self._idempotency_lock:
+            # periodic cleanup of expired entries
+            expired = [
+                k
+                for k, v in self._idempotency_cache.items()
+                if (now - float(v.get("created_ts", 0.0) or 0.0)) > ttl_s
+            ]
+            for k in expired:
+                self._idempotency_cache.pop(k, None)
+            row = self._idempotency_cache.get(cache_key)
+            if not row:
+                return None
+            if str(row.get("fingerprint", "")) != fingerprint:
+                raise ValueError("idempotency key reuse with different payload")
+            return int(row.get("status", 200)), dict(row.get("payload", {}))
+
+    def idempotency_put(self, *, method: str, path: str, key: str, fingerprint: str, status: int, payload: dict) -> None:
+        if not key.strip():
+            return
+        cache_key = f"{method.upper()}|{path}|{key.strip()}"
+        max_entries = max(100, int(settings.management_api_idempotency_max_entries))
+        now = time.time()
+        with self._idempotency_lock:
+            self._idempotency_cache[cache_key] = {
+                "created_ts": now,
+                "fingerprint": fingerprint,
+                "status": int(status),
+                "payload": dict(payload),
+            }
+            if len(self._idempotency_cache) > max_entries:
+                # Trim oldest entries first.
+                oldest = sorted(
+                    self._idempotency_cache.items(),
+                    key=lambda kv: float(kv[1].get("created_ts", 0.0) or 0.0),
+                )
+                for k, _v in oldest[: max(1, len(self._idempotency_cache) - max_entries)]:
+                    self._idempotency_cache.pop(k, None)
+
 
 def make_management_handler(state: ManagementState):
+    def _openapi_spec() -> dict:
+        return {
+            "openapi": "3.0.3",
+            "info": {
+                "title": "AI GameMaster Management API",
+                "version": "1.0.0",
+                "description": "Versioned management surface for bots, config, auth, gameplay admin, and health.",
+            },
+            "servers": [{"url": "/"}],
+            "components": {
+                "securitySchemes": {
+                    "bearerAuth": {
+                        "type": "http",
+                        "scheme": "bearer",
+                        "bearerFormat": "Token",
+                    }
+                },
+                "schemas": {
+                    "Envelope": {
+                        "type": "object",
+                        "properties": {
+                            "ok": {"type": "boolean"},
+                            "message": {"type": "string"},
+                            "error": {"type": "string"},
+                            "error_code": {"type": "string"},
+                            "error_message": {"type": "string"},
+                            "error_details": {"type": "object"},
+                        },
+                        "required": ["ok"],
+                    }
+                },
+            },
+            "security": [{"bearerAuth": []}],
+            "x-auth-scopes": {
+                "system.admin": [
+                    "/api/v1/config/*",
+                    "/api/v1/bots*",
+                    "/api/v1/logs/*",
+                    "/api/v1/debug/checks/*",
+                    "/api/v1/agency/*",
+                ],
+                "user.manage": ["/api/v1/auth/*"],
+                "campaign.read": ["/api/v1/campaigns*", "/api/v1/game/*"],
+                "campaign.write": ["/api/v1/campaigns/*/rules*", "/api/v1/campaigns/*/ruleset"],
+                "campaign.play": ["/api/v1/campaigns/*/crew/*", "/api/v1/dice/roll"],
+            },
+            "paths": {
+                "/api/v1/meta": {"get": {"summary": "API metadata", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/health": {"get": {"summary": "Health snapshot", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/openapi.json": {
+                    "get": {"summary": "OpenAPI document", "responses": {"200": {"description": "OpenAPI spec"}}}
+                },
+                "/api/v1/config/llm": {
+                    "get": {"summary": "Get LLM config", "responses": {"200": {"description": "OK"}}},
+                    "put": {"summary": "Update LLM config", "responses": {"200": {"description": "Updated"}}},
+                },
+                "/api/v1/config/web": {
+                    "get": {"summary": "Get web config", "responses": {"200": {"description": "OK"}}},
+                    "put": {"summary": "Update web config", "responses": {"200": {"description": "Updated"}}},
+                },
+                "/api/v1/bots": {
+                    "get": {"summary": "List bot configs", "responses": {"200": {"description": "OK"}}},
+                    "post": {"summary": "Create bot config", "responses": {"201": {"description": "Created"}}},
+                },
+                "/api/v1/bots/{id}": {
+                    "put": {"summary": "Update bot config", "responses": {"200": {"description": "Updated"}}},
+                    "delete": {"summary": "Delete bot config", "responses": {"200": {"description": "Deleted"}}},
+                },
+                "/api/v1/logs/system": {"get": {"summary": "List system logs", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/logs/audit": {"get": {"summary": "List audit logs", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/auth/login": {"post": {"summary": "Authenticate auth user", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/auth/users": {
+                    "get": {"summary": "List users", "responses": {"200": {"description": "OK"}}},
+                    "post": {"summary": "Create user", "responses": {"201": {"description": "Created"}}},
+                },
+                "/api/v1/auth/roles": {
+                    "get": {"summary": "List roles", "responses": {"200": {"description": "OK"}}},
+                    "post": {"summary": "Create role", "responses": {"201": {"description": "Created"}}},
+                },
+                "/api/v1/auth/permissions": {
+                    "get": {"summary": "List permissions", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/agency/rules": {
+                    "get": {"summary": "List agency rules", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/campaigns": {"get": {"summary": "List campaigns", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/campaigns/{id}": {
+                    "get": {"summary": "Get campaign by id", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/campaigns/{id}/rules": {
+                    "get": {"summary": "Get campaign rules", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/campaigns/{id}/turns": {
+                    "get": {"summary": "Get campaign turns", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/campaigns/{id}/ruleset": {
+                    "get": {"summary": "Get campaign ruleset", "responses": {"200": {"description": "OK"}}},
+                    "post": {"summary": "Set campaign ruleset", "responses": {"200": {"description": "Updated"}}},
+                },
+                "/api/v1/game/rulesets": {
+                    "get": {"summary": "List rulesets", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/game/rulesets/upsert": {
+                    "post": {"summary": "Upsert ruleset", "responses": {"200": {"description": "Updated"}}}
+                },
+                "/api/v1/game/rulebooks": {
+                    "get": {"summary": "List rulebooks", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/game/rulebooks/upsert": {
+                    "post": {"summary": "Upsert rulebook", "responses": {"200": {"description": "Updated"}}}
+                },
+                "/api/v1/game/rulebooks/search": {
+                    "get": {"summary": "Search rulebook entries", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/game/rulebooks/entries/upsert": {
+                    "post": {"summary": "Upsert rulebook entry", "responses": {"200": {"description": "Updated"}}}
+                },
+                "/api/v1/campaigns/{id}/crew/preview": {
+                    "post": {"summary": "Preview crew turn", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/campaigns/{id}/crew/apply": {
+                    "post": {"summary": "Apply crew turn", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/dice/roll": {"post": {"summary": "Evaluate dice roll", "responses": {"200": {"description": "OK"}}}},
+                "/api/v1/debug/checks/db": {
+                    "post": {"summary": "DB connectivity check", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/debug/checks/ollama": {
+                    "post": {"summary": "Ollama connectivity check", "responses": {"200": {"description": "OK"}}}
+                },
+                "/api/v1/debug/checks/openai": {
+                    "post": {"summary": "OpenAI connectivity check", "responses": {"200": {"description": "OK"}}}
+                },
+            },
+        }
+
     class ManagementHandler(BaseHTTPRequestHandler):
         def _send_json(self, code: int, payload: dict) -> None:
             body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
+            correlation_id = str(getattr(self, "_correlation_id", "") or "").strip()
+            if correlation_id:
+                self.send_header("X-Correlation-ID", correlation_id)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def _bind_correlation_id(self) -> None:
+            incoming = str(self.headers.get("X-Correlation-ID", "") or "").strip()
+            self._correlation_id = incoming or str(uuid4())
+            client = getattr(state, "db_api", None)
+            if client is not None and hasattr(client, "set_correlation_id"):
+                client.set_correlation_id(self._correlation_id)
+
+        @staticmethod
+        def _clear_db_api_correlation() -> None:
+            client = getattr(state, "db_api", None)
+            if client is not None and hasattr(client, "clear_correlation_id"):
+                client.clear_correlation_id()
+
+        def _error(self, status: int, code: str, message: str, details: dict | None = None) -> None:
+            merged_details = dict(details or {})
+            merged_details.setdefault("path", str(getattr(self, "path", "") or ""))
+            correlation_id = str(getattr(self, "_correlation_id", "") or "").strip()
+            if correlation_id:
+                merged_details.setdefault("correlation_id", correlation_id)
+            self._send_json(
+                int(status),
+                {
+                    "ok": False,
+                    "error": str(message),
+                    "error_code": str(code),
+                    "error_message": str(message),
+                    "error_details": merged_details,
+                },
+            )
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", "0") or "0")
@@ -684,11 +1411,45 @@ def make_management_handler(state: ManagementState):
             auth = self.headers.get("Authorization", "")
             if state.auth_ok(auth):
                 return True
-            self._send_json(401, {"ok": False, "error": "unauthorized"})
+            self._error(401, "unauthorized", "unauthorized")
             return False
 
+        def _idempotency_key(self) -> str:
+            return (
+                str(self.headers.get("Idempotency-Key", "") or "").strip()
+                or str(self.headers.get("X-Idempotency-Key", "") or "").strip()
+            )
+
+        @staticmethod
+        def _fingerprint(payload: dict | None) -> str:
+            data = payload if isinstance(payload, dict) else {}
+            return json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+
+        def _request_key(self) -> str:
+            forwarded = str(self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+            remote = forwarded or str(self.client_address[0] if self.client_address else "unknown")
+            auth = str(self.headers.get("Authorization", "") or "")
+            return f"{remote}|{auth[:32]}"
+
+        def _check_rate_limit(self, is_mutation: bool = False) -> bool:
+            key = self._request_key()
+            request_limiter = getattr(state, "request_limiter", None)
+            mutation_limiter = getattr(state, "mutation_limiter", None)
+            if request_limiter is not None and not request_limiter.allow(key):
+                self._error(429, "rate_limited", "rate_limited", {"scope": "management_api"})
+                return False
+            if is_mutation and mutation_limiter is not None and not mutation_limiter.allow(key):
+                self._error(429, "rate_limited", "rate_limited", {"scope": "management_api_mutation"})
+                return False
+            return True
+
         def do_GET(self):  # noqa: N802
+            self._bind_correlation_id()
             if not self._require_auth():
+                self._clear_db_api_correlation()
+                return
+            if not self._check_rate_limit(is_mutation=False):
+                self._clear_db_api_correlation()
                 return
             parsed = urlparse(self.path)
             path = parsed.path
@@ -711,13 +1472,23 @@ def make_management_handler(state: ManagementState):
                                 "config_llm": "/api/v1/config/llm",
                                 "config_web": "/api/v1/config/web",
                                 "bots": "/api/v1/bots",
-                                "logs_system": "/api/v1/logs/system",
-                                "logs_audit": "/api/v1/logs/audit",
-                                "debug_checks": "/api/v1/debug/checks/*",
-                                "db_api_health": f"{state.db_api.base_url}/db/v1/health",
-                            },
+                                "openapi": "/api/v1/openapi.json",
+                            "logs_system": "/api/v1/logs/system",
+                            "logs_audit": "/api/v1/logs/audit",
+                            "auth_users": "/api/v1/auth/users",
+                            "auth_roles": "/api/v1/auth/roles",
+                            "auth_permissions": "/api/v1/auth/permissions",
+                            "agency_rules": "/api/v1/agency/rules",
+                            "crew_preview": "/api/v1/campaigns/{id}/crew/preview",
+                            "crew_apply": "/api/v1/campaigns/{id}/crew/apply",
+                            "debug_checks": "/api/v1/debug/checks/*",
+                            "db_api_health": f"{state.db_api.base_url}/db/v1/health",
+                        },
                         },
                     )
+                    return
+                if path == "/api/v1/openapi.json":
+                    self._send_json(200, _openapi_spec())
                     return
                 if path == "/api/v1/health":
                     snap = state.health_state.snapshot()
@@ -744,21 +1515,324 @@ def make_management_handler(state: ManagementState):
                     rows = state.get_audit_logs(limit=limit)
                     self._send_json(200, {"ok": True, "rows": rows})
                     return
-                self._send_json(404, {"ok": False, "error": "not_found"})
+                if path == "/api/v1/auth/users":
+                    self._send_json(200, {"ok": True, "users": state.list_auth_users()})
+                    return
+                if path == "/api/v1/auth/roles":
+                    self._send_json(200, {"ok": True, "roles": state.list_auth_roles()})
+                    return
+                if path == "/api/v1/auth/permissions":
+                    self._send_json(200, {"ok": True, "permissions": state.list_auth_permissions()})
+                    return
+                if path == "/api/v1/agency/rules":
+                    self._send_json(200, {"ok": True, "rows": state.list_agency_rules()})
+                    return
+                if path == "/api/v1/campaigns":
+                    limit = max(1, min(1000, int((query.get("limit", ["500"]) or ["500"])[0])))
+                    self._send_json(200, {"ok": True, "rows": state.list_campaigns(limit=limit)})
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/rules"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/rules")].strip().strip("/"))
+                    self._send_json(200, {"ok": True, "rules": state.get_campaign_rules(campaign_id)})
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/turns"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/turns")].strip().strip("/"))
+                    limit = max(1, min(500, int((query.get("limit", ["50"]) or ["50"])[0])))
+                    self._send_json(200, {"ok": True, "rows": state.list_campaign_turns(campaign_id, limit=limit)})
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/ruleset"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/ruleset")].strip().strip("/"))
+                    self._send_json(200, {"ok": True, "ruleset": state.get_campaign_ruleset(campaign_id)})
+                    return
+                if path.startswith("/api/v1/campaigns/"):
+                    campaign_id = int(path.rsplit("/", 1)[-1])
+                    self._send_json(200, {"ok": True, "row": state.get_campaign(campaign_id)})
+                    return
+                if path == "/api/v1/game/rulesets":
+                    enabled_only = str((query.get("enabled_only", ["false"]) or ["false"])[0]).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    self._send_json(200, {"ok": True, "rows": state.list_rulesets(enabled_only=enabled_only)})
+                    return
+                if path == "/api/v1/game/rulebooks":
+                    enabled_only = str((query.get("enabled_only", ["false"]) or ["false"])[0]).strip().lower() in {
+                        "1",
+                        "true",
+                        "yes",
+                        "on",
+                    }
+                    self._send_json(200, {"ok": True, "rows": state.list_rulebooks(enabled_only=enabled_only)})
+                    return
+                if path == "/api/v1/game/rulebooks/search":
+                    q = str((query.get("query", [""]) or [""])[0]).strip()
+                    limit = max(1, min(20, int((query.get("limit", ["6"]) or ["6"])[0])))
+                    self._send_json(200, {"ok": True, "rows": state.search_rulebook_entries(q, limit=limit)})
+                    return
+                self._error(404, "not_found", "not_found")
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "GET request failed", source="management_api", metadata={"error": str(exc)})
-                self._send_json(500, {"ok": False, "error": str(exc)})
+                self._error(500, "internal_error", str(exc))
+            finally:
+                self._clear_db_api_correlation()
 
         def do_POST(self):  # noqa: N802
+            self._bind_correlation_id()
             if not self._require_auth():
+                self._clear_db_api_correlation()
+                return
+            if not self._check_rate_limit(is_mutation=True):
+                self._clear_db_api_correlation()
                 return
             parsed = urlparse(self.path)
             path = parsed.path
             try:
                 payload = self._read_json()
+                idem_key = self._idempotency_key()
+                fingerprint = self._fingerprint(payload)
+                if idem_key and hasattr(state, "idempotency_get"):
+                    cached = state.idempotency_get(method="POST", path=path, key=idem_key, fingerprint=fingerprint)
+                    if cached is not None:
+                        code, cached_payload = cached
+                        self._send_json(code, cached_payload)
+                        return
+                if path == "/api/v1/auth/login":
+                    body = state.auth_login(str(payload.get("username", "")), str(payload.get("password", "")))
+                    self._send_json(200, body)
+                    return
                 if path == "/api/v1/bots":
                     created = state.create_bot_config(payload)
-                    self._send_json(201, {"ok": True, "created": created})
+                    body = {"ok": True, "created": created}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=201,
+                            payload=body,
+                        )
+                    self._send_json(201, body)
+                    return
+                if path == "/api/v1/auth/users":
+                    ok, msg = state.create_auth_user(payload)
+                    code = 201 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path.startswith("/api/v1/auth/users/") and path.endswith("/roles"):
+                    username = path[len("/api/v1/auth/users/") : -len("/roles")].strip().strip("/")
+                    ok, msg = state.assign_auth_role(username, str(payload.get("role", "")))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path.startswith("/api/v1/auth/users/") and path.endswith("/password"):
+                    username = path[len("/api/v1/auth/users/") : -len("/password")].strip().strip("/")
+                    ok, msg = state.set_auth_password(username, str(payload.get("password", "")))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path.startswith("/api/v1/auth/users/") and path.endswith("/discord"):
+                    username = path[len("/api/v1/auth/users/") : -len("/discord")].strip().strip("/")
+                    ok, msg = state.link_auth_discord(username, str(payload.get("discord_user_id", "")))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/auth/roles":
+                    ok, msg = state.create_auth_role(payload)
+                    code = 201 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/agency/rules/upsert":
+                    ok, msg = state.upsert_agency_rule(payload)
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/crew/preview"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/crew/preview")].strip().strip("/"))
+                    preview = state.crew_preview(campaign_id, payload)
+                    body = {"ok": True, **preview}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=200,
+                            payload=body,
+                        )
+                    self._send_json(200, body)
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/crew/apply"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/crew/apply")].strip().strip("/"))
+                    result = state.crew_apply(campaign_id, payload)
+                    body = {"ok": True, **result}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=200,
+                            payload=body,
+                        )
+                    self._send_json(200, body)
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/rules/set"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/rules/set")].strip().strip("/"))
+                    key = str(payload.get("rule_key", "")).strip()
+                    if not key:
+                        raise ValueError("rule_key is required")
+                    value = str(payload.get("rule_value", ""))
+                    row = state.set_campaign_rule(campaign_id, key, value)
+                    body = {"ok": True, "row": row}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=200,
+                            payload=body,
+                        )
+                    self._send_json(200, body)
+                    return
+                if path.startswith("/api/v1/campaigns/") and path.endswith("/ruleset"):
+                    campaign_id = int(path[len("/api/v1/campaigns/") : -len("/ruleset")].strip().strip("/"))
+                    ok, detail = state.set_campaign_ruleset(campaign_id, str(payload.get("ruleset_key", "")))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": detail}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/game/rulesets/upsert":
+                    ok, detail = state.upsert_ruleset(payload)
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": detail}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/game/rulebooks/upsert":
+                    ok, detail = state.upsert_rulebook(payload)
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": detail}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/game/rulebooks/entries/upsert":
+                    ok, detail = state.upsert_rulebook_entry(payload)
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": detail}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
+                    return
+                if path == "/api/v1/dice/roll":
+                    ok, roll_payload = state.roll_dice(str(payload.get("expression", "")))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "roll": roll_payload}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(
+                            method="POST",
+                            path=path,
+                            key=idem_key,
+                            fingerprint=fingerprint,
+                            status=code,
+                            payload=body,
+                        )
+                    self._send_json(code, body)
                     return
                 if path == "/api/v1/debug/checks/db":
                     ok, detail = state.check_db()
@@ -772,54 +1846,135 @@ def make_management_handler(state: ManagementState):
                     ok, detail = state.check_openai()
                     self._send_json(200 if ok else 503, {"ok": ok, "check": "openai", "detail": detail})
                     return
-                self._send_json(404, {"ok": False, "error": "not_found"})
+                self._error(404, "not_found", "not_found")
             except ValueError as exc:
-                self._send_json(400, {"ok": False, "error": str(exc)})
+                message = str(exc)
+                status = 409 if "idempotency key reuse" in message.lower() else 400
+                code = "conflict" if status == 409 else "bad_request"
+                self._error(status, code, message)
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "POST request failed", source="management_api", metadata={"error": str(exc)})
-                self._send_json(500, {"ok": False, "error": str(exc)})
+                self._error(500, "internal_error", str(exc))
+            finally:
+                self._clear_db_api_correlation()
 
         def do_PUT(self):  # noqa: N802
+            self._bind_correlation_id()
             if not self._require_auth():
+                self._clear_db_api_correlation()
+                return
+            if not self._check_rate_limit(is_mutation=True):
+                self._clear_db_api_correlation()
                 return
             parsed = urlparse(self.path)
             path = parsed.path
             try:
                 payload = self._read_json()
+                idem_key = self._idempotency_key()
+                fingerprint = self._fingerprint(payload)
+                if idem_key and hasattr(state, "idempotency_get"):
+                    cached = state.idempotency_get(method="PUT", path=path, key=idem_key, fingerprint=fingerprint)
+                    if cached is not None:
+                        code, cached_payload = cached
+                        self._send_json(code, cached_payload)
+                        return
                 if path == "/api/v1/config/llm":
                     result = state.update_llm_config(payload)
-                    self._send_json(200, {"ok": True, **result})
+                    body = {"ok": True, **result}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="PUT", path=path, key=idem_key, fingerprint=fingerprint, status=200, payload=body)
+                    self._send_json(200, body)
                     return
                 if path == "/api/v1/config/web":
                     result = state.update_web_config(payload)
-                    self._send_json(200, {"ok": True, **result})
+                    body = {"ok": True, **result}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="PUT", path=path, key=idem_key, fingerprint=fingerprint, status=200, payload=body)
+                    self._send_json(200, body)
                     return
                 if path.startswith("/api/v1/bots/"):
                     bot_id = int(path.rsplit("/", 1)[-1])
                     updated = state.update_bot_config(bot_id, payload)
-                    self._send_json(200, {"ok": True, "updated": updated})
+                    body = {"ok": True, "updated": updated}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="PUT", path=path, key=idem_key, fingerprint=fingerprint, status=200, payload=body)
+                    self._send_json(200, body)
                     return
-                self._send_json(404, {"ok": False, "error": "not_found"})
+                if path.startswith("/api/v1/auth/roles/") and path.endswith("/permissions"):
+                    role_name = path[len("/api/v1/auth/roles/") : -len("/permissions")].strip().strip("/")
+                    desired = payload.get("permissions", [])
+                    if not isinstance(desired, list):
+                        raise ValueError("permissions must be a list")
+                    ok, msg = state.update_auth_role_permissions(role_name, [str(x) for x in desired])
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="PUT", path=path, key=idem_key, fingerprint=fingerprint, status=code, payload=body)
+                    self._send_json(code, body)
+                    return
+                if path.startswith("/api/v1/agency/rules/") and path.endswith("/enabled"):
+                    rid = path[len("/api/v1/agency/rules/") : -len("/enabled")].strip().strip("/")
+                    ok, msg = state.set_agency_rule_enabled(rid, bool(payload.get("is_enabled", False)))
+                    code = 200 if ok else 400
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="PUT", path=path, key=idem_key, fingerprint=fingerprint, status=code, payload=body)
+                    self._send_json(code, body)
+                    return
+                self._error(404, "not_found", "not_found")
             except ValueError as exc:
-                self._send_json(400, {"ok": False, "error": str(exc)})
+                message = str(exc)
+                status = 409 if "idempotency key reuse" in message.lower() else 400
+                code = "conflict" if status == 409 else "bad_request"
+                self._error(status, code, message)
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "PUT request failed", source="management_api", metadata={"error": str(exc)})
-                self._send_json(500, {"ok": False, "error": str(exc)})
+                self._error(500, "internal_error", str(exc))
+            finally:
+                self._clear_db_api_correlation()
 
         def do_DELETE(self):  # noqa: N802
+            self._bind_correlation_id()
             if not self._require_auth():
+                self._clear_db_api_correlation()
+                return
+            if not self._check_rate_limit(is_mutation=True):
+                self._clear_db_api_correlation()
                 return
             parsed = urlparse(self.path)
             path = parsed.path
             try:
+                idem_key = self._idempotency_key()
+                fingerprint = self._fingerprint({})
+                if idem_key and hasattr(state, "idempotency_get"):
+                    cached = state.idempotency_get(method="DELETE", path=path, key=idem_key, fingerprint=fingerprint)
+                    if cached is not None:
+                        code, cached_payload = cached
+                        self._send_json(code, cached_payload)
+                        return
                 if path.startswith("/api/v1/bots/"):
                     bot_id = int(path.rsplit("/", 1)[-1])
                     deleted = state.delete_bot_config(bot_id)
-                    self._send_json(200, {"ok": True, "deleted": deleted})
+                    body = {"ok": True, "deleted": deleted}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="DELETE", path=path, key=idem_key, fingerprint=fingerprint, status=200, payload=body)
+                    self._send_json(200, body)
                     return
-                self._send_json(404, {"ok": False, "error": "not_found"})
+                if path.startswith("/api/v1/agency/rules/"):
+                    rid = path.rsplit("/", 1)[-1]
+                    ok, msg = state.remove_agency_rule(rid)
+                    code = 200 if ok else 404
+                    body = {"ok": ok, "message": msg}
+                    if idem_key and hasattr(state, "idempotency_put"):
+                        state.idempotency_put(method="DELETE", path=path, key=idem_key, fingerprint=fingerprint, status=code, payload=body)
+                    self._send_json(code, body)
+                    return
+                self._error(404, "not_found", "not_found")
             except ValueError as exc:
-                self._send_json(400, {"ok": False, "error": str(exc)})
+                message = str(exc)
+                status = 409 if "idempotency key reuse" in message.lower() else 400
+                code = "conflict" if status == 409 else "bad_request"
+                self._error(status, code, message)
             except Exception as exc:  # noqa: BLE001
                 state.logger.write(
                     "api",
@@ -828,7 +1983,9 @@ def make_management_handler(state: ManagementState):
                     source="management_api",
                     metadata={"error": str(exc)},
                 )
-                self._send_json(500, {"ok": False, "error": str(exc)})
+                self._error(500, "internal_error", str(exc))
+            finally:
+                self._clear_db_api_correlation()
 
         def log_message(self, _format, *args):
             return
@@ -932,6 +2089,7 @@ def main() -> int:
         ollama_url=settings.ollama_url,
         logger=logger,
     )
+    logger.set_db_api_client(DBApiClient(base_url=f"http://127.0.0.1:{args.db_api_port}", token=settings.db_api_token, timeout_s=12))
     health_state.set_proc("db_api", db_api_ref.popen)
     health_state.set_proc("bot_manager", bot_manager_ref.popen)
     health_state.set_proc("streamlit", streamlit_ref.popen)
@@ -994,22 +2152,96 @@ def main() -> int:
     last_health_log = 0.0
     consecutive_health_failures = 0
     last_alert_sent_ts = 0.0
+    alert_open = False
     health_interval = max(5, int(settings.health_log_interval_s))
     alert_threshold = max(1, int(settings.health_alert_consecutive_failures))
     alert_webhook = settings.health_alert_webhook_url.strip()
     alert_cooldown_s = max(10, int(settings.health_alert_webhook_cooldown_s))
+    traceback_buffers: dict[str, dict[str, object]] = {}
+    traceback_flush_after_s = 0.25
+    runtime_alerts = RuntimeAlertMonitor()
+
+    def flush_traceback_buffer(service: str) -> None:
+        buf = traceback_buffers.pop(service, None)
+        if not buf:
+            return
+        lines = [str(x) for x in buf.get("lines", []) if str(x) != ""]
+        if not lines:
+            return
+        message = "\n".join(lines)
+        logger.write(
+            service,
+            infer_level(message),
+            message,
+            source="subprocess",
+            metadata={"coalesced_lines": len(lines)},
+        )
+
     while not stop_flag["value"]:
         try:
             service, line = q.get(timeout=0.5)
+            # Collate traceback output into a single multiline log record so DB/UI
+            # show complete errors instead of one-row-per-line fragments.
+            if is_traceback_start(line):
+                active = traceback_buffers.setdefault(service, {"lines": [], "last_ts": 0.0})
+                active["lines"].append(line)
+                active["last_ts"] = time.time()
+                continue
+            active = traceback_buffers.get(service)
+            if active:
+                if is_traceback_line(line):
+                    active["lines"].append(line)
+                    active["last_ts"] = time.time()
+                    continue
+                flush_traceback_buffer(service)
+
             metric = parse_aigm_metric_line(line)
             if metric:
                 health_state.record_turn_metric(metric["name"], metric.get("fields", {}))
+                runtime_alerts.observe_metric(metric["name"], metric.get("fields", {}))
+            runtime_alerts.observe_line(line)
             logger.write(service, infer_level(line), line, source="subprocess")
         except queue.Empty:
             pass
 
-        health_state.set_log_queue_depth(q.qsize())
         now = time.time()
+        for buffered_service, buffered in list(traceback_buffers.items()):
+            last_ts = float(buffered.get("last_ts", now))
+            if (now - last_ts) >= traceback_flush_after_s:
+                flush_traceback_buffer(buffered_service)
+
+        health_state.set_log_queue_depth(q.qsize())
+        for alert in runtime_alerts.evaluate(queue_depth=q.qsize()):
+            alert_type = str(alert.get("type", "runtime_alert"))
+            if not runtime_alerts.should_emit(alert_type):
+                continue
+            alert_payload = {
+                "event": f"aigm_{alert_type}",
+                "timestamp": utc_now_iso(),
+                "detail": alert.get("detail", {}),
+            }
+            logger.write(
+                "health",
+                "WARNING",
+                f"Runtime alert: {alert_type}",
+                metadata=alert_payload,
+            )
+            if alert_webhook:
+                try:
+                    post_json_webhook(alert_webhook, alert_payload, timeout_s=8)
+                    logger.write(
+                        "health",
+                        "INFO",
+                        "Runtime alert webhook delivered.",
+                        metadata={"event": alert_payload["event"]},
+                    )
+                except Exception as exc:
+                    logger.write(
+                        "health",
+                        "ERROR",
+                        "Runtime alert webhook delivery failed.",
+                        metadata={"event": alert_payload["event"], "error": str(exc)},
+                    )
         # Periodic structured snapshots make health regressions visible in UI and files.
         if now - last_health_log >= health_interval:
             snap = health_state.snapshot()
@@ -1018,9 +2250,17 @@ def main() -> int:
             logger.write("health", level, "Periodic health snapshot.", metadata=snap)
             if ok:
                 consecutive_health_failures = 0
+                if alert_open:
+                    logger.write(
+                        "health",
+                        "INFO",
+                        "Health recovered after alert condition.",
+                        metadata={"alert_threshold": alert_threshold},
+                    )
+                    alert_open = False
             else:
                 consecutive_health_failures += 1
-                if consecutive_health_failures >= alert_threshold:
+                if consecutive_health_failures >= alert_threshold and not alert_open:
                     alert_payload = {
                         "event": "aigm_health_alert",
                         "timestamp": utc_now_iso(),
@@ -1034,6 +2274,7 @@ def main() -> int:
                         "Health failure alert threshold reached.",
                         metadata=alert_payload,
                     )
+                    alert_open = True
                     if alert_webhook and (now - last_alert_sent_ts) >= alert_cooldown_s:
                         try:
                             post_json_webhook(alert_webhook, alert_payload, timeout_s=8)
@@ -1074,6 +2315,8 @@ def main() -> int:
             stop_flag["value"] = True
 
     logger.write("supervisor", "INFO", "Supervisor stopping.")
+    for buffered_service in list(traceback_buffers.keys()):
+        flush_traceback_buffer(buffered_service)
     for proc in (db_api_ref.popen, bot_manager_ref.popen, streamlit_ref.popen):
         if proc.poll() is None:
             proc.terminate()
