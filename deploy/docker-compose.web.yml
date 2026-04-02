@@ -1,0 +1,147 @@
+services:
+  db-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aigm-db-api
+    restart: unless-stopped
+    env_file:
+      - ./env/web.env
+    command: >
+      sh -c "python -m aigm.db.bootstrap &&
+             python -m aigm.ops.db_api --bind 0.0.0.0 --port ${AIGM_DB_API_PORT:-9542}"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; token=os.getenv('AIGM_DB_API_TOKEN','').strip(); headers={'Authorization': f'Bearer {token}'} if token else {}; req=urllib.request.Request('http://127.0.0.1:9542/db/v1/health', headers=headers); urllib.request.urlopen(req, timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ports:
+      - "${AIGM_DB_API_PORT:-9542}:9542"
+    volumes:
+      - ../logs:/app/logs
+      - ../component_state:/app/component_state
+    networks:
+      - web_internal
+      - edge
+
+  management-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aigm-management-api
+    restart: unless-stopped
+    env_file:
+      - ./env/web.env
+    command: >
+      sh -c "python -m aigm.db.bootstrap &&
+             python -m aigm.ops.management_api
+             --bind 0.0.0.0
+             --port ${AIGM_MANAGEMENT_API_PORT:-9541}
+             --cwd /app
+             --streamlit-url http://web-ui:${AIGM_STREAMLIT_PORT:-9531}
+             --db-api-url http://db-api:${AIGM_DB_API_PORT:-9542}
+             --health-port ${AIGM_HEALTHCHECK_PORT:-9540}
+             --streamlit-port ${AIGM_STREAMLIT_PORT:-9531}"
+    depends_on:
+      db-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os, urllib.request; token=os.getenv('AIGM_SYS_ADMIN_TOKEN','').strip(); headers={'Authorization': f'Bearer {token}'} if token else {}; req=urllib.request.Request('http://127.0.0.1:9541/api/v1/meta', headers=headers); urllib.request.urlopen(req, timeout=5)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ports:
+      - "${AIGM_MANAGEMENT_API_PORT:-9541}:9541"
+    volumes:
+      - ../logs:/app/logs
+      - ../component_state:/app/component_state
+    networks:
+      - web_internal
+      - edge
+
+  web-ui:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aigm-web-ui
+    restart: unless-stopped
+    env_file:
+      - ./env/web.env
+    command: >
+      sh -c "python -m aigm.db.bootstrap &&
+             python -m streamlit run streamlit_app.py
+             --server.port ${AIGM_STREAMLIT_PORT:-9531}
+             --server.address 0.0.0.0
+             --server.headless true"
+    depends_on:
+      db-api:
+        condition: service_healthy
+      management-api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9531/_stcore/health', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    ports:
+      - "${AIGM_STREAMLIT_PORT:-9531}:9531"
+    volumes:
+      - ../logs:/app/logs
+      - ../component_state:/app/component_state
+    networks:
+      - web_internal
+      - edge
+
+  health-api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aigm-health-api
+    restart: unless-stopped
+    env_file:
+      - ./env/web.env
+    command: >
+      sh -c "python -m aigm.db.bootstrap &&
+             python -m aigm.ops.health_api
+             --bind 0.0.0.0
+             --port ${AIGM_HEALTHCHECK_PORT:-9540}
+             --streamlit-url http://web-ui:${AIGM_STREAMLIT_PORT:-9531}"
+    depends_on:
+      web-ui:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9540/metrics', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    ports:
+      - "${AIGM_HEALTHCHECK_PORT:-9540}:9540"
+    volumes:
+      - ../logs:/app/logs
+      - ../component_state:/app/component_state
+    networks:
+      - web_internal
+      - edge
+
+networks:
+  web_internal:
+    name: ${AIGM_WEB_INTERNAL_NETWORK:-aigm-web-internal}
+    internal: true
+  edge:
+    name: ${AIGM_EDGE_NETWORK:-aigm-edge}

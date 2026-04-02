@@ -717,12 +717,14 @@ class ManagementState:
             "runtime": {
                 "streamlit_port": self.streamlit_port,
                 "healthcheck_port": self.health_port,
+                "management_api_url": settings.management_api_url,
                 "healthcheck_url": settings.healthcheck_url,
                 "log_dir": settings.log_dir,
             },
             "persisted_env": {
                 "AIGM_STREAMLIT_PORT": env.get("AIGM_STREAMLIT_PORT", ""),
                 "AIGM_HEALTHCHECK_PORT": env.get("AIGM_HEALTHCHECK_PORT", ""),
+                "AIGM_MANAGEMENT_API_URL": env.get("AIGM_MANAGEMENT_API_URL", ""),
                 "AIGM_HEALTHCHECK_URL": env.get("AIGM_HEALTHCHECK_URL", ""),
                 "AIGM_LOG_DIR": env.get("AIGM_LOG_DIR", ""),
             },
@@ -732,6 +734,7 @@ class ManagementState:
         map_keys = {
             "streamlit_port": "AIGM_STREAMLIT_PORT",
             "healthcheck_port": "AIGM_HEALTHCHECK_PORT",
+            "management_api_url": "AIGM_MANAGEMENT_API_URL",
             "healthcheck_url": "AIGM_HEALTHCHECK_URL",
             "log_dir": "AIGM_LOG_DIR",
         }

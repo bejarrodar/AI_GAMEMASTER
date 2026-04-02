@@ -7,7 +7,11 @@ from pathlib import Path
 
 import streamlit as st
 from sqlalchemy import create_engine
-from openai import OpenAI
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - optional in stub or Ollama-only environments.
+    OpenAI = None
 
 from aigm.adapters.llm import LLMAdapter
 from aigm.agents.crew import default_agent_crew_definition
@@ -25,7 +29,7 @@ db_api_client = DBApiClient(settings.db_api_url, token=settings.db_api_token, ti
 
 
 def management_api_request(method: str, path: str, payload: dict | None = None, query: dict | None = None) -> dict:
-    base = f"http://127.0.0.1:{settings.management_api_port}"
+    base = settings.management_api_url.rstrip("/")
     url = f"{base}{path}"
     if query:
         q = parse.urlencode({k: v for k, v in query.items() if v is not None and str(v) != ""})
@@ -185,6 +189,8 @@ def ollama_delete_model(url: str, model: str) -> tuple[bool, str]:
 
 
 def openai_list_models(api_key: str, base_url: str) -> tuple[bool, list[str], str]:
+    if OpenAI is None:
+        return False, [], "OpenAI SDK is not installed."
     try:
         kwargs: dict = {"api_key": api_key.strip()}
         if base_url.strip():

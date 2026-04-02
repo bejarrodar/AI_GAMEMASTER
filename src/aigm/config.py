@@ -51,9 +51,11 @@ class Settings(BaseSettings):
     streamlit_port: int = 9531
     healthcheck_port: int = 9540
     management_api_port: int = 9541
+    management_api_url: str = "http://127.0.0.1:9541"
     db_api_port: int = 9542
     db_api_url: str = "http://127.0.0.1:9542"
     db_api_token: str = ""
+    bot_health_port: int = 9550
     gameplay_use_db_api: bool = False
     component_state_dir: str = "./component_state"
     healthcheck_url: str = "http://127.0.0.1:9540/health"

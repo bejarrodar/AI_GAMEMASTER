@@ -7,7 +7,10 @@ import time
 from difflib import get_close_matches
 from urllib import error, request
 
-from openai import OpenAI
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - optional dependency in some local/test setups.
+    OpenAI = None
 
 from aigm.config import settings
 from aigm.schemas.game import AIResponse, CharacterState, Command, OutputReview, PlayerIntentExtraction, WorldState
@@ -126,6 +129,8 @@ class LLMAdapter:
 
     @staticmethod
     def _openai_client() -> OpenAI:
+        if OpenAI is None:
+            raise RuntimeError("openai package is not installed")
         kwargs: dict = {}
         if settings.openai_api_key.strip():
             kwargs["api_key"] = settings.openai_api_key.strip()

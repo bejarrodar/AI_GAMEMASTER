@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import threading
 
 import discord
 from discord.ext import commands
@@ -23,6 +27,11 @@ service = GameService(LLMAdapter())
 authenticated_admin_ids: set[str] = set()
 turn_job_queue: asyncio.Queue | None = None
 turn_workers_started = False
+bot_runtime_state: dict[str, object] = {
+    "ready": False,
+    "bot_label": "default",
+    "bot_config_id": None,
+}
 
 
 @dataclass
@@ -193,9 +202,56 @@ def _enqueue_dead_letter_sync(job: TurnJob, error_message: str, source: str) -> 
         )
 
 
+def _bot_health_payload() -> dict[str, object]:
+    queue_depth = 0
+    if turn_job_queue is not None:
+        queue_depth = turn_job_queue.qsize()
+    return {
+        "ok": bool(bot.is_ready()),
+        "ready": bool(bot.is_ready()),
+        "bot_user": str(bot.user) if bot.user else "",
+        "bot_label": str(bot_runtime_state.get("bot_label", "default") or "default"),
+        "bot_config_id": bot_runtime_state.get("bot_config_id"),
+        "queue_depth": int(queue_depth),
+        "worker_count": max(1, int(settings.turn_worker_count)),
+    }
+
+
+def _make_bot_health_handler():
+    class BotHealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path not in ("/health", "/healthz"):
+                self.send_response(404)
+                self.end_headers()
+                return
+            payload = _bot_health_payload()
+            body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+            self.send_response(200 if payload["ok"] else 503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *args):
+            return
+
+    return BotHealthHandler
+
+
+def _start_bot_health_server(bind: str, port: int) -> ThreadingHTTPServer | None:
+    if int(port) <= 0:
+        return None
+    server = ThreadingHTTPServer((bind, int(port)), _make_bot_health_handler())
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[bot-health] listening on http://{bind}:{port}/health", flush=True)
+    return server
+
+
 @bot.event
 async def on_ready() -> None:
     global turn_job_queue, turn_workers_started
+    bot_runtime_state["ready"] = True
     print(f"Logged in as {bot.user}")
     if turn_job_queue is None:
         turn_job_queue = asyncio.Queue(maxsize=max(1, int(settings.turn_worker_queue_max)))
@@ -798,7 +854,28 @@ async def on_message(message: discord.Message) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the AI GameMaster Discord bot.")
+    parser.add_argument("--token", default="")
+    parser.add_argument("--bot-label", default="default")
+    parser.add_argument("--bot-config-id", type=int, default=None)
+    parser.add_argument("--health-bind", default="0.0.0.0")
+    parser.add_argument("--health-port", type=int, default=settings.bot_health_port)
+    args = parser.parse_args()
+
+    token = str(args.token or settings.discord_token).strip()
+    if not token:
+        raise RuntimeError("Set AIGM_DISCORD_TOKEN in environment or pass --token")
+
+    bot_runtime_state["bot_label"] = args.bot_label
+    bot_runtime_state["bot_config_id"] = args.bot_config_id
+    bot_runtime_state["ready"] = False
+
     init_db()
-    if not settings.discord_token:
-        raise RuntimeError("Set AIGM_DISCORD_TOKEN in environment")
-    bot.run(settings.discord_token)
+    health_server = _start_bot_health_server(args.health_bind, int(args.health_port))
+    try:
+        bot.run(token)
+    finally:
+        bot_runtime_state["ready"] = False
+        if health_server is not None:
+            health_server.shutdown()
+            health_server.server_close()
