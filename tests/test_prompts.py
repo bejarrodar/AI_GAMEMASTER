@@ -29,3 +29,8 @@ def test_selected_rules_text_fallback_for_empty_list() -> None:
     text = selected_rules_text([])
     assert "TITLE: Absolute Agency Boundary" in text
     assert "TITLE: Pause Over Violation" in text
+
+
+def test_balanced_profile_includes_no_other_pc_puppeteering() -> None:
+    prompt = build_system_prompt("You are fair.", "Keep tension high.")
+    assert "TITLE: No Puppeteering Other Player Characters" in prompt

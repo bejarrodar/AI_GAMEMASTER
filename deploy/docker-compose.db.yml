@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: aigm-postgres
+    restart: unless-stopped
+    env_file:
+      - ./env/db.env
+    ports:
+      - "${AIGM_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - aigm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - db_internal
+      - edge
+
+volumes:
+  aigm_pgdata:
+
+networks:
+  db_internal:
+    name: ${AIGM_DB_INTERNAL_NETWORK:-aigm-db-internal}
+    internal: true
+  edge:
+    name: ${AIGM_EDGE_NETWORK:-aigm-edge}

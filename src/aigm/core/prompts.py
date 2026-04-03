@@ -92,6 +92,17 @@ PRINCIPLE:
 - It is better to pause than to violate player agency.
 RATIONALE:
 - Stalled scenes can recover; broken trust is harder to recover.""",
+    "R10_no_other_pc_puppeteering": """RULE_ID: R10_no_other_pc_puppeteering
+TITLE: No Puppeteering Other Player Characters
+PRIORITY: critical
+RULE:
+- Treat every player-controlled character as owned by a human player.
+- Never decide or narrate actions, reactions, emotions, dialogue, intent, or movement for a player-controlled character unless that exact player declared it.
+ALLOWED:
+- Narrate NPC actions and world state.
+- Narrate outcomes of explicitly declared player actions.
+FORBIDDEN_EXAMPLE:
+- "Shadewind dodges" (if Shadewind is player-controlled and did not declare that).""",
 }
 
 RULE_PROFILES: dict[str, list[str]] = {
@@ -99,6 +110,7 @@ RULE_PROFILES: dict[str, list[str]] = {
         "R1_absolute_agency_boundary",
         "R2_external_only_narration",
         "R3_prompt_dont_pilot",
+        "R10_no_other_pc_puppeteering",
         "R9_pause_over_agency_violation",
     ],
     "balanced": [
@@ -107,6 +119,7 @@ RULE_PROFILES: dict[str, list[str]] = {
         "R3_prompt_dont_pilot",
         "R5_no_auto_execution",
         "R6_item_resource_sanctity",
+        "R10_no_other_pc_puppeteering",
         "R9_pause_over_agency_violation",
     ],
     "full": list(DEFAULT_RULE_BLOCKS.keys()),

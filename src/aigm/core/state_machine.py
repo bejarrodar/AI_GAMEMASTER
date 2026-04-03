@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from copy import deepcopy
 
 from aigm.schemas.game import Command, TimedEffect, WorldState
@@ -77,12 +78,17 @@ def apply_commands(state: WorldState, commands: list[Command]) -> WorldState:
                 raise StateError("add_effect requires effect key")
             if cmd.effect_category not in ("magical", "physical", "misc"):
                 raise StateError("add_effect requires effect_category")
+            effect_desc = cmd.text or ""
+            if isinstance(cmd.amount, int) and cmd.amount > 0:
+                marker = f"damage_per_turn={cmd.amount}"
+                if marker not in effect_desc:
+                    effect_desc = f"{effect_desc} {marker}".strip()
             actor.effects = [e for e in actor.effects if e.key != cmd.key]
             actor.effects.append(
                 TimedEffect(
                     key=cmd.key,
                     category=cmd.effect_category,
-                    description=cmd.text or "",
+                    description=effect_desc,
                     duration_turns=cmd.duration_turns,
                 )
             )
@@ -105,8 +111,18 @@ def apply_commands(state: WorldState, commands: list[Command]) -> WorldState:
 def tick_effects(state: WorldState) -> WorldState:
     updated = deepcopy(state)
     for name in updated.party:
+        actor = updated.party[name]
         next_effects = []
-        for effect in updated.party[name].effects:
+        for effect in actor.effects:
+            effect_text = f"{effect.key} {effect.description}".lower()
+            damage_per_turn = 0
+            m = re.search(r"damage_per_turn\s*[:=]\s*(\d+)", effect_text)
+            if m:
+                damage_per_turn = int(m.group(1))
+            elif "poison" in effect_text:
+                damage_per_turn = 1
+            if damage_per_turn > 0:
+                actor.hp = max(0, actor.hp - damage_per_turn)
             if effect.duration_turns is None:
                 next_effects.append(effect)
                 continue
@@ -120,5 +136,5 @@ def tick_effects(state: WorldState) -> WorldState:
                         duration_turns=turns_left,
                     )
                 )
-        updated.party[name].effects = next_effects
+        actor.effects = next_effects
     return updated

@@ -14,6 +14,7 @@ class TimedEffect(BaseModel):
 
 class CharacterState(BaseModel):
     name: str
+    description: str = ""
     hp: int = Field(ge=0, le=999)
     max_hp: int = Field(ge=1, le=999)
     stats: dict[str, int] = Field(default_factory=dict)
@@ -22,10 +23,30 @@ class CharacterState(BaseModel):
     effects: list[TimedEffect] = Field(default_factory=list)
 
 
+class NPCState(BaseModel):
+    name: str
+    description: str = ""
+    disposition: str = "neutral"
+    hp: int | None = Field(default=None, ge=0, le=999)
+    location: str = ""
+    flags: dict[str, str | int | bool] = Field(default_factory=dict)
+
+
+class LocationState(BaseModel):
+    name: str
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+    connected_to: list[str] = Field(default_factory=list)
+    flags: dict[str, str | int | bool] = Field(default_factory=dict)
+
+
 class WorldState(BaseModel):
     scene: str = ""
     flags: dict[str, str | int | bool] = Field(default_factory=dict)
     party: dict[str, CharacterState] = Field(default_factory=dict)
+    npcs: dict[str, NPCState] = Field(default_factory=dict)
+    locations: dict[str, LocationState] = Field(default_factory=dict)
+    combat_round: int | None = Field(default=None, ge=1)
 
 
 class Command(BaseModel):
@@ -53,3 +74,54 @@ class Command(BaseModel):
 class AIResponse(BaseModel):
     narration: str
     commands: list[Command] = Field(default_factory=list)
+
+
+class InventoryActionIntent(BaseModel):
+    action: Literal["use", "add", "remove", "steal", "pickup", "other"]
+    item_key: str
+    quantity: int = Field(default=1, ge=1)
+    target_character: str | None = None
+    owner: Literal["self", "target", "scene", "unknown"] = "unknown"
+
+
+class IntentFeasibilityCheck(BaseModel):
+    action: Literal["use", "add", "remove", "steal", "pickup", "other"]
+    item_key: str = ""
+    target_character: str | None = None
+    question: str
+    is_possible: bool
+    reason: str = ""
+    object_type: str = "unknown"
+    portability: Literal["portable", "non_portable", "unknown"] = "unknown"
+    requires_payment: bool | None = None
+    cost_amount: int | None = Field(default=None, ge=0)
+    currency: str | None = None
+    payer_owner: Literal["self", "target", "scene", "unknown"] | None = None
+    has_required_funds: bool | None = None
+    acquisition_mode: Literal["pickup", "purchase", "steal", "loot", "gift", "craft", "unknown"] | None = None
+    would_be_theft: bool | None = None
+    location_context: str | None = None
+
+
+class IntentRelevanceSignal(BaseModel):
+    entity_type: Literal["item", "effect", "scene", "other"] = "other"
+    key: str = ""
+    context_tag: str = "general"
+    score: float = Field(default=0.5, ge=0.0, le=1.0)
+    reason: str = ""
+
+
+class PlayerIntentExtraction(BaseModel):
+    inventory: list[InventoryActionIntent] = Field(default_factory=list)
+    commands: list[Command] = Field(default_factory=list)
+    feasibility_checks: list[IntentFeasibilityCheck] = Field(default_factory=list)
+    relevance_signals: list[IntentRelevanceSignal] = Field(default_factory=list)
+
+
+class OutputReview(BaseModel):
+    plausible: bool = True
+    breaks_pc_autonomy: bool = False
+    violations: list[str] = Field(default_factory=list)
+    revised_narration: str = ""
+    input_aligned: bool = True
+    alignment_score: float = Field(default=1.0, ge=0.0, le=1.0)

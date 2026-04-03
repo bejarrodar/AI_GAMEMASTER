@@ -1,0 +1,35 @@
+services:
+  discord-bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: aigm-discord-bot
+    restart: unless-stopped
+    env_file:
+      - ./env/bot.env
+    command: >
+      sh -c "python -m aigm.db.bootstrap &&
+             python -m aigm.bot
+             --health-bind 0.0.0.0
+             --health-port ${AIGM_BOT_HEALTH_PORT:-9550}"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9550/healthz', timeout=5)"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    ports:
+      - "${AIGM_BOT_HEALTH_PORT:-9550}:9550"
+    volumes:
+      - ../logs:/app/logs
+      - ../component_state:/app/component_state
+    networks:
+      - bot_internal
+      - edge
+
+networks:
+  bot_internal:
+    name: ${AIGM_BOT_INTERNAL_NETWORK:-aigm-bot-internal}
+    internal: true
+  edge:
+    name: ${AIGM_EDGE_NETWORK:-aigm-edge}
