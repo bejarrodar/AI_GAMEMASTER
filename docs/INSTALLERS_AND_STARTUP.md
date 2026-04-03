@@ -60,6 +60,11 @@ Containers are optional and not required.
   - `docker compose -f deploy/docker-compose.optional.yml --profile web up -d`
   - `docker compose -f deploy/docker-compose.optional.yml --profile llm up -d`
 
+Notes:
+
+- `deploy/docker-compose.optional.yml` now requires `AIGM_POSTGRES_PASSWORD` to be supplied from the environment instead of shipping a hardcoded default.
+- In production-style deployments, also set `AIGM_SYS_ADMIN_TOKEN` and `AIGM_DB_API_TOKEN`. The services are designed to fail closed when those tokens are required but absent.
+
 ## Backup and Restore
 
 Run from project root:

@@ -78,7 +78,23 @@ def resolve_thread_name_from_discord(thread_id: str) -> str | None:
 
 def current_auth_user() -> dict | None:
     user = st.session_state.get("auth_user")
-    return user if isinstance(user, dict) else None
+    issued_at = st.session_state.get("auth_user_issued_at")
+    if not isinstance(user, dict):
+        return None
+    try:
+        issued_at_value = float(issued_at)
+    except (TypeError, ValueError):
+        st.session_state.pop("auth_user", None)
+        st.session_state.pop("auth_user_issued_at", None)
+        return None
+    ttl_s = max(300, int(settings.streamlit_session_ttl_s))
+    import time
+
+    if (time.time() - issued_at_value) > ttl_s:
+        st.session_state.pop("auth_user", None)
+        st.session_state.pop("auth_user_issued_at", None)
+        return None
+    return user
 
 
 def ui_has_perm(_db_unused, permission: str) -> bool:
@@ -236,7 +252,10 @@ if settings.auth_enforce:
             )
             auth_user = resp.get("user") if bool(resp.get("ok", False)) else None
             if auth_user:
+                import time
+
                 st.session_state["auth_user"] = auth_user
+                st.session_state["auth_user_issued_at"] = time.time()
                 st.success("Authenticated.")
                 st.rerun()
             else:

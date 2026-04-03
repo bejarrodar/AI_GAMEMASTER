@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import queue
@@ -609,10 +610,10 @@ class ManagementState:
     def auth_ok(self, authorization: str) -> bool:
         token = self.api_token.strip()
         if not token:
-            return True
+            return not settings.auth_require_sys_admin_token
         value = (authorization or "").strip()
         expected = f"Bearer {token}"
-        return value == expected
+        return hmac.compare_digest(value, expected)
 
     def _audit(self, action: str, metadata: dict | None = None) -> None:
         self.logger.write(
@@ -1428,6 +1429,9 @@ def make_management_handler(state: ManagementState):
             self._error(401, "unauthorized", "unauthorized")
             return False
 
+        def _internal_error(self) -> None:
+            self._error(500, "internal_error", "internal_error")
+
         def _idempotency_key(self) -> str:
             return (
                 str(self.headers.get("Idempotency-Key", "") or "").strip()
@@ -1592,7 +1596,7 @@ def make_management_handler(state: ManagementState):
                 self._error(404, "not_found", "not_found")
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "GET request failed", source="management_api", metadata={"error": str(exc)})
-                self._error(500, "internal_error", str(exc))
+                self._internal_error()
             finally:
                 self._clear_db_api_correlation()
 
@@ -1600,7 +1604,8 @@ def make_management_handler(state: ManagementState):
             self._bind_correlation_id()
             parsed = urlparse(self.path)
             path = parsed.path
-            if not self._require_auth():
+            allow_unauthenticated_login = path == "/api/v1/auth/login"
+            if not allow_unauthenticated_login and not self._require_auth():
                 self._clear_db_api_correlation()
                 return
             if not self._check_rate_limit(path=path, is_mutation=True):
@@ -1872,7 +1877,7 @@ def make_management_handler(state: ManagementState):
                 self._error(status, code, message)
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "POST request failed", source="management_api", metadata={"error": str(exc)})
-                self._error(500, "internal_error", str(exc))
+                self._internal_error()
             finally:
                 self._clear_db_api_correlation()
 
@@ -1947,7 +1952,7 @@ def make_management_handler(state: ManagementState):
                 self._error(status, code, message)
             except Exception as exc:  # noqa: BLE001
                 state.logger.write("api", "ERROR", "PUT request failed", source="management_api", metadata={"error": str(exc)})
-                self._error(500, "internal_error", str(exc))
+                self._internal_error()
             finally:
                 self._clear_db_api_correlation()
 
@@ -2001,7 +2006,7 @@ def make_management_handler(state: ManagementState):
                     source="management_api",
                     metadata={"error": str(exc)},
                 )
-                self._error(500, "internal_error", str(exc))
+                self._internal_error()
             finally:
                 self._clear_db_api_correlation()
 

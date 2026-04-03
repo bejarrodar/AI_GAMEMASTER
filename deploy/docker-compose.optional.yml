@@ -15,7 +15,7 @@ services:
     environment:
       POSTGRES_DB: aigm
       POSTGRES_USER: aigm
-      POSTGRES_PASSWORD: aigm_password_change_me
+      POSTGRES_PASSWORD: ${AIGM_POSTGRES_PASSWORD:?Set AIGM_POSTGRES_PASSWORD before starting compose}
     ports:
       - "5432:5432"
     volumes:

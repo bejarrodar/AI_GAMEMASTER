@@ -166,6 +166,7 @@ Default roles include:
 
 Enable permission enforcement:
 - `AIGM_AUTH_ENFORCE=true`
+- `AIGM_AUTH_REQUIRE_SYS_ADMIN_TOKEN=true`
 
 Optional bootstrap admin on startup:
 - `AIGM_AUTH_BOOTSTRAP_ADMIN_USERNAME=<username>`
@@ -176,6 +177,13 @@ When enforcement is enabled:
 - Discord admin commands can be authorized either by legacy `!adminauth` token flow or by linking a Discord user to an auth user with `system.admin`.
 - Streamlit requires login and gates operations by permission.
 - Admin tab includes auth user creation, Discord-linking, role assignment, and password reset tools.
+
+Security defaults and tradeoffs:
+- Management API and DB API now fail closed when their bearer tokens are unset. This is safer for production because a missing secret no longer silently exposes privileged endpoints.
+- The one intentional exception is `POST /api/v1/auth/login` on the management API. Streamlit needs a way to establish a UI session before it has a bearer token, so that route stays reachable without `AIGM_SYS_ADMIN_TOKEN`, but it still goes through the management API rate limiter.
+- Streamlit UI sessions are cached in-process for usability, but they now expire automatically after `AIGM_STREAMLIT_SESSION_TTL_S`. This avoids permanent browser sessions while keeping the UI simple.
+- Discord `!adminauth` sessions are intentionally short-lived and now expire after `AIGM_BOT_ADMIN_SESSION_TTL_S`. This is a tradeoff between convenience and limiting the blast radius of a leaked admin token.
+- Health and operational detail endpoints are meant for private networks, reverse proxies, or authenticated operators. They are not designed as public internet endpoints.
 
 This allows secure connections when Postgres sits behind a Cloudflare/Cloudflared path.
 
@@ -201,6 +209,7 @@ AIGM_DATABASE_CONNECT_TIMEOUT_S=10
 AIGM_DATABASE_AUTO_INIT=true
 AIGM_DATABASE_USE_ALEMBIC=false
 AIGM_SYS_ADMIN_TOKEN=change_this_admin_secret
+AIGM_AUTH_REQUIRE_SYS_ADMIN_TOKEN=true
 AIGM_AUTH_ENFORCE=false
 AIGM_AUTH_BOOTSTRAP_ADMIN_USERNAME=
 AIGM_AUTH_BOOTSTRAP_ADMIN_PASSWORD=
@@ -228,6 +237,12 @@ AIGM_MANAGEMENT_API_PORT=9541
 AIGM_MANAGEMENT_API_IDEMPOTENCY_TTL_S=3600
 AIGM_MANAGEMENT_API_IDEMPOTENCY_MAX_ENTRIES=2000
 AIGM_DB_API_PORT=9542
+AIGM_DB_API_TOKEN=change_this_db_api_secret
+AIGM_DB_API_REQUIRE_TOKEN=true
+AIGM_DB_API_RATE_LIMIT_WINDOW_S=60
+AIGM_DB_API_RATE_LIMIT_MAX_REQUESTS=600
+AIGM_STREAMLIT_SESSION_TTL_S=28800
+AIGM_BOT_ADMIN_SESSION_TTL_S=3600
 AIGM_DB_API_URL=http://127.0.0.1:9542
 AIGM_DB_API_TOKEN=
 AIGM_COMPONENT_STATE_DIR=./component_state

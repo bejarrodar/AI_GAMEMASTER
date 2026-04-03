@@ -40,3 +40,5 @@ docker compose -f deploy/docker-compose.bot.yml --env-file deploy/env/bot.env up
 
 - The web-facing HTTP services are safe to place behind a load balancer as long as the balancer forwards traffic to the exposed container ports and uses the provided health endpoints.
 - The Discord bot is not a normal request/response web service. You can monitor or orchestrate it with the bot health endpoint, but you should not run multiple active replicas of the same Discord token behind a load balancer.
+- The DB API and management API are operator surfaces, not public APIs. Put them on private networks or require authenticated access through your proxy/LB.
+- The management API intentionally keeps the login route reachable without the sys-admin bearer token so the Streamlit UI can establish a session. All other privileged routes are expected to stay protected by `AIGM_SYS_ADMIN_TOKEN`.

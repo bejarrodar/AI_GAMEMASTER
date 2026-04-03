@@ -20,6 +20,7 @@ This checklist covers production hardening for network exposure and operations.
 ## Secrets and Credentials
 
 - prefer secret manager or file-mounted secrets over plaintext `.env`
+- set both `AIGM_SYS_ADMIN_TOKEN` and `AIGM_DB_API_TOKEN`; production APIs are intended to fail closed when these are absent
 - supported runtime sources include:
   - `AIGM_SECRET_SOURCE=aws_secrets_manager` (AWS CLI-backed retrieval)
   - `AIGM_SECRET_SOURCE=command` (custom command emits JSON secrets)
@@ -27,6 +28,7 @@ This checklist covers production hardening for network exposure and operations.
 - rotate Discord/OpenAI/admin tokens regularly
 - grant least privilege on DB credentials
 - monitor for leaked credentials and revoke quickly
+- do not leave `AIGM_AUTH_BOOTSTRAP_ADMIN_PASSWORD` populated after first-run bootstrap unless you intentionally want startup seeding behavior
 
 ## Observability and Alerts
 
@@ -40,3 +42,4 @@ This checklist covers production hardening for network exposure and operations.
 - ensure proxy preserves client IP (if needed for auditing)
 - configure request body and timeout limits aligned with expected LLM latency
 - add basic WAF/rate limit policies at edge/proxy layer
+- keep health, management, and DB API endpoints on private networks or behind explicit authentication; they are operational surfaces, not public APIs

@@ -6,17 +6,13 @@ ENV PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/*
-
 COPY pyproject.toml README.md /app/
 COPY src /app/src
 COPY alembic /app/alembic
 COPY alembic.ini streamlit_app.py /app/
 COPY sql /app/sql
 
-RUN pip install --upgrade pip \
+RUN pip install --upgrade "pip>=25.0" "setuptools>=80.0.0" "wheel>=0.46.2" \
     && pip install ".[ui]"
 
 RUN useradd --create-home --shell /bin/bash aigm \

@@ -152,3 +152,14 @@ def test_typing_indicator_loop_triggers_typing_until_stopped() -> None:
 
     calls = asyncio.run(_run())
     assert calls >= 1
+
+
+def test_bot_admin_session_expires(monkeypatch) -> None:
+    bot_module.authenticated_admin_ids.clear()
+    monkeypatch.setattr(bot_module.settings, "bot_admin_session_ttl_s", 60)
+    now = 1_000.0
+    monkeypatch.setattr(bot_module.time, "time", lambda: now)
+    bot_module._grant_admin_session("u1")
+    assert bot_module._has_active_admin_session("u1") is True
+    monkeypatch.setattr(bot_module.time, "time", lambda: now + 61)
+    assert bot_module._has_active_admin_session("u1") is False

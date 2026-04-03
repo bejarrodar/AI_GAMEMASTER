@@ -231,6 +231,31 @@ def test_management_requires_bearer_token_when_configured() -> None:
         server.server_close()
 
 
+def test_management_login_is_reachable_without_bearer_token() -> None:
+    state = _State()
+    state.api_token = "abc123"
+    state.auth_ok = lambda authorization: authorization == "Bearer abc123"
+    state.auth_login = lambda username, password: {"ok": username == "admin" and password == "secret", "user": {"username": username}}
+    server = ThreadingHTTPServer(("127.0.0.1", 0), supervisor.make_management_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/api/v1/auth/login"
+        req = request.Request(
+            url,
+            method="POST",
+            data=json.dumps({"username": "admin", "password": "secret"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with request.urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        assert payload["ok"] is True
+        assert payload["user"]["username"] == "admin"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_management_error_envelope_for_not_found() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), supervisor.make_management_handler(_State()))
     thread = threading.Thread(target=server.serve_forever, daemon=True)

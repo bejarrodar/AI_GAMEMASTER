@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import threading
+import time
 
 import discord
 from discord.ext import commands
@@ -24,7 +25,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 service = GameService(LLMAdapter())
-authenticated_admin_ids: set[str] = set()
+authenticated_admin_ids: dict[str, float] = {}
 turn_job_queue: asyncio.Queue | None = None
 turn_workers_started = False
 bot_runtime_state: dict[str, object] = {
@@ -61,6 +62,32 @@ def _campaign_started(db, campaign) -> bool:
         .one_or_none()
         is not None
     )
+
+
+def _admin_session_ttl_s() -> float:
+    return max(60.0, float(settings.bot_admin_session_ttl_s))
+
+
+def _prune_expired_admin_sessions() -> None:
+    now = time.time()
+    expired = [actor_id for actor_id, expires_at in authenticated_admin_ids.items() if float(expires_at) <= now]
+    for actor_id in expired:
+        authenticated_admin_ids.pop(actor_id, None)
+
+
+def _grant_admin_session(actor_id: str) -> None:
+    authenticated_admin_ids[str(actor_id)] = time.time() + _admin_session_ttl_s()
+
+
+def _has_active_admin_session(actor_id: str) -> bool:
+    _prune_expired_admin_sessions()
+    expires_at = authenticated_admin_ids.get(str(actor_id))
+    if expires_at is None:
+        return False
+    if float(expires_at) <= time.time():
+        authenticated_admin_ids.pop(str(actor_id), None)
+        return False
+    return True
 
 
 def _possible_commands() -> list[str]:
@@ -314,6 +341,7 @@ async def on_message(message: discord.Message) -> None:
             print(f"[thread-join] failed joining thread {message.channel.id}: {exc}")
 
     with SessionLocal() as db:
+        _prune_expired_admin_sessions()
         service.seed_default_gameplay_knowledge(db)
         thread_name = (getattr(message.channel, "name", "") or "").strip()
         campaign = service.get_or_create_campaign(
@@ -351,18 +379,19 @@ async def on_message(message: discord.Message) -> None:
             token = content.removeprefix("!adminauth ").strip()
             ok = service.authenticate_sys_admin(db, actor_id, message.author.display_name, token)
             if ok:
-                authenticated_admin_ids.add(actor_id)
-                await message.channel.send("Sys admin authentication successful.")
+                _grant_admin_session(actor_id)
+                ttl_minutes = int(_admin_session_ttl_s() // 60)
+                await message.channel.send(f"Sys admin authentication successful. Session expires in about {ttl_minutes} minutes.")
             else:
                 await message.channel.send("Sys admin authentication failed.")
             return
 
         if cmd_name == "!adminlogout":
-            authenticated_admin_ids.discard(actor_id)
+            authenticated_admin_ids.pop(actor_id, None)
             await message.channel.send("Sys admin session cleared.")
             return
 
-        is_admin = actor_id in authenticated_admin_ids and service.is_sys_admin(db, actor_id)
+        is_admin = _has_active_admin_session(actor_id) and service.is_sys_admin(db, actor_id)
 
         if cmd_name == "!startstory":
             content = "!startgame story"

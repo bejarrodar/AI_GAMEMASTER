@@ -133,6 +133,58 @@ def test_db_api_requires_auth() -> None:
         server.server_close()
 
 
+def test_db_api_state_fails_closed_when_token_required_and_missing(monkeypatch) -> None:
+    monkeypatch.setattr(db_api.settings, "db_api_token", "")
+    monkeypatch.setattr(db_api.settings, "db_api_require_token", True)
+    state = db_api.DBAPIState()
+    assert state.auth_ok("") is False
+    assert state.auth_ok("Bearer anything") is False
+
+
+def test_db_api_rate_limit_scope() -> None:
+    state = _State()
+    state.request_limiter = db_api.APIRateLimiter(window_s=60, max_requests=1)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), db_api.make_handler(state))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        first = _req(f"{base}/db/v1/health")
+        assert first["ok"] is True
+        try:
+            _req(f"{base}/db/v1/health")
+            raise AssertionError("expected rate_limited response")
+        except error.HTTPError as exc:
+            assert exc.code == 429
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert payload["error_code"] == "rate_limited"
+            assert payload["error_details"]["scope"] == "db_api"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_db_api_bad_limit_returns_400() -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), db_api.make_handler(_State()))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        req = request.Request(f"{base}/db/v1/logs/system?limit=abc", headers={"Authorization": "Bearer ok"})
+        try:
+            with request.urlopen(req, timeout=3):
+                pass
+            raise AssertionError("expected bad_request response")
+        except error.HTTPError as exc:
+            assert exc.code == 400
+            payload = json.loads(exc.read().decode("utf-8"))
+            assert payload["error_code"] == "bad_request"
+            assert payload["error_message"] == "limit must be an integer"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_db_api_bots_and_health_endpoints() -> None:
     server = ThreadingHTTPServer(("127.0.0.1", 0), db_api.make_handler(_State()))
     thread = threading.Thread(target=server.serve_forever, daemon=True)

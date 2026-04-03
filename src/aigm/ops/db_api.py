@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,27 @@ from aigm.db.models import (
 from aigm.db.session import SessionLocal
 
 
+class APIRateLimiter:
+    def __init__(self, window_s: int, max_requests: int) -> None:
+        self.window_s = max(1, int(window_s))
+        self.max_requests = max(1, int(max_requests))
+        self._buckets: dict[str, list[float]] = {}
+
+    def allow(self, key: str) -> bool:
+        import time
+
+        now = time.time()
+        cutoff = now - float(self.window_s)
+        bucket_key = key.strip() or "unknown"
+        bucket = [x for x in self._buckets.get(bucket_key, []) if x >= cutoff]
+        if len(bucket) >= self.max_requests:
+            self._buckets[bucket_key] = bucket
+            return False
+        bucket.append(now)
+        self._buckets[bucket_key] = bucket
+        return True
+
+
 def _parse_bool(value: str | None, default: bool | None = None) -> bool | None:
     if value is None:
         return default
@@ -43,11 +65,18 @@ def _parse_bool(value: str | None, default: bool | None = None) -> bool | None:
 class DBAPIState:
     def __init__(self) -> None:
         self.token = settings.db_api_token.strip()
+        self.require_token = bool(settings.db_api_require_token)
+        self.request_limiter = APIRateLimiter(
+            window_s=settings.db_api_rate_limit_window_s,
+            max_requests=settings.db_api_rate_limit_max_requests,
+        )
 
     def auth_ok(self, authorization: str) -> bool:
         if not self.token:
-            return True
-        return (authorization or "").strip() == f"Bearer {self.token}"
+            return not self.require_token
+        provided = (authorization or "").strip()
+        expected = f"Bearer {self.token}"
+        return hmac.compare_digest(provided, expected)
 
     @staticmethod
     def health() -> dict:
@@ -544,9 +573,39 @@ def make_handler(state: DBAPIState):
             self._error(401, "unauthorized", "unauthorized")
             return False
 
+        def _request_key(self) -> str:
+            forwarded = str(self.headers.get("X-Forwarded-For", "") or "").split(",")[0].strip()
+            remote = forwarded or str(self.client_address[0] if self.client_address else "unknown")
+            auth = str(self.headers.get("Authorization", "") or "")
+            return f"{remote}|{auth[:32]}"
+
+        def _check_rate_limit(self) -> bool:
+            limiter = getattr(state, "request_limiter", None)
+            if limiter is None:
+                return True
+            if limiter.allow(self._request_key()):
+                return True
+            self._error(429, "rate_limited", "rate_limited", {"scope": "db_api"})
+            return False
+
+        @staticmethod
+        def _parse_int_param(value: str | None, *, name: str, minimum: int | None = None) -> int:
+            try:
+                parsed = int(str(value or "").strip())
+            except ValueError as exc:
+                raise ValueError(f"{name} must be an integer") from exc
+            if minimum is not None and parsed < minimum:
+                raise ValueError(f"{name} must be >= {minimum}")
+            return parsed
+
+        def _internal_error(self) -> None:
+            self._error(500, "internal_error", "internal_error")
+
         def do_GET(self):  # noqa: N802
             self._bind_correlation_id()
             if not self._auth():
+                return
+            if not self._check_rate_limit():
                 return
             parsed = urlparse(self.path)
             path = parsed.path
@@ -561,13 +620,13 @@ def make_handler(state: DBAPIState):
                     self._send_json(200, {"ok": True, "rows": state.list_bots(enabled)})
                     return
                 if path == "/db/v1/logs/system":
-                    limit = int((query.get("limit", ["100"]) or ["100"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["100"]) or ["100"])[0], name="limit", minimum=1)
                     service = str((query.get("service", [""]) or [""])[0]).strip()
                     level = str((query.get("level", [""]) or [""])[0]).strip().upper()
                     self._send_json(200, {"ok": True, "rows": state.list_system_logs(limit, service, level)})
                     return
                 if path == "/db/v1/logs/audit":
-                    limit = int((query.get("limit", ["100"]) or ["100"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["100"]) or ["100"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_audit_logs(limit)})
                     return
                 if path == "/db/v1/debug/table-counts":
@@ -582,66 +641,72 @@ def make_handler(state: DBAPIState):
                     self._send_json(200, {"ok": True, "row": row})
                     return
                 if path == "/db/v1/campaigns/by-id":
-                    campaign_id = int((query.get("campaign_id", ["0"]) or ["0"])[0])
-                    if campaign_id <= 0:
-                        self._error(400, "bad_request", "campaign_id is required")
-                        return
+                    campaign_id = self._parse_int_param(
+                        (query.get("campaign_id", ["0"]) or ["0"])[0], name="campaign_id", minimum=1
+                    )
                     row = state.campaign_by_id(campaign_id)
                     self._send_json(200, {"ok": True, "row": row})
                     return
                 if path == "/db/v1/campaigns/rules":
-                    campaign_id = int((query.get("campaign_id", ["0"]) or ["0"])[0])
-                    if campaign_id <= 0:
-                        self._error(400, "bad_request", "campaign_id is required")
-                        return
+                    campaign_id = self._parse_int_param(
+                        (query.get("campaign_id", ["0"]) or ["0"])[0], name="campaign_id", minimum=1
+                    )
                     self._send_json(200, {"ok": True, "rules": state.campaign_rules(campaign_id)})
                     return
                 if path == "/db/v1/campaigns":
-                    limit = int((query.get("limit", ["200"]) or ["200"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["200"]) or ["200"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_campaigns(limit)})
                     return
                 if path == "/db/v1/turns":
-                    campaign_id = int((query.get("campaign_id", ["0"]) or ["0"])[0])
-                    if campaign_id <= 0:
-                        self._error(400, "bad_request", "campaign_id is required")
-                        return
-                    limit = int((query.get("limit", ["50"]) or ["50"])[0])
+                    campaign_id = self._parse_int_param(
+                        (query.get("campaign_id", ["0"]) or ["0"])[0], name="campaign_id", minimum=1
+                    )
+                    limit = self._parse_int_param((query.get("limit", ["50"]) or ["50"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_turn_logs(campaign_id, limit)})
                     return
                 if path == "/db/v1/knowledge/items":
-                    limit = int((query.get("limit", ["200"]) or ["200"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["200"]) or ["200"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_item_knowledge(limit)})
                     return
                 if path == "/db/v1/knowledge/item-relevance":
-                    limit = int((query.get("limit", ["300"]) or ["300"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["300"]) or ["300"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_global_item_relevance(limit)})
                     return
                 if path == "/db/v1/knowledge/effects":
-                    limit = int((query.get("limit", ["200"]) or ["200"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["200"]) or ["200"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_effect_knowledge(limit)})
                     return
                 if path == "/db/v1/knowledge/effect-relevance":
-                    limit = int((query.get("limit", ["300"]) or ["300"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["300"]) or ["300"])[0], name="limit", minimum=1)
                     self._send_json(200, {"ok": True, "rows": state.list_global_effect_relevance(limit)})
                     return
                 if path == "/db/v1/dice-rolls":
-                    limit = int((query.get("limit", ["100"]) or ["100"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["100"]) or ["100"])[0], name="limit", minimum=1)
                     campaign_id_raw = (query.get("campaign_id", [""]) or [""])[0]
-                    campaign_id = int(campaign_id_raw) if str(campaign_id_raw).strip() else None
+                    campaign_id = (
+                        self._parse_int_param(campaign_id_raw, name="campaign_id", minimum=1)
+                        if str(campaign_id_raw).strip()
+                        else None
+                    )
                     self._send_json(200, {"ok": True, "rows": state.list_dice_roll_logs(limit, campaign_id)})
                     return
                 if path == "/db/v1/dead-letters":
-                    limit = int((query.get("limit", ["50"]) or ["50"])[0])
+                    limit = self._parse_int_param((query.get("limit", ["50"]) or ["50"])[0], name="limit", minimum=1)
                     status = str((query.get("status", [""]) or [""])[0]).strip().lower()
                     self._send_json(200, {"ok": True, "rows": state.list_dead_letter_events(status, limit)})
                     return
                 self._error(404, "not_found", "not_found")
+            except ValueError as exc:
+                self._error(400, "bad_request", str(exc))
             except Exception as exc:  # noqa: BLE001
-                self._error(500, "internal_error", str(exc))
+                print(f"[db_api] GET {path} failed: {exc}", flush=True)
+                self._internal_error()
 
         def do_POST(self):  # noqa: N802
             self._bind_correlation_id()
             if not self._auth():
+                return
+            if not self._check_rate_limit():
                 return
             parsed = urlparse(self.path)
             try:
@@ -693,11 +758,14 @@ def make_handler(state: DBAPIState):
             except ValueError as exc:
                 self._error(400, "bad_request", str(exc))
             except Exception as exc:  # noqa: BLE001
-                self._error(500, "internal_error", str(exc))
+                print(f"[db_api] POST {parsed.path} failed: {exc}", flush=True)
+                self._internal_error()
 
         def do_PUT(self):  # noqa: N802
             self._bind_correlation_id()
             if not self._auth():
+                return
+            if not self._check_rate_limit():
                 return
             parsed = urlparse(self.path)
             try:
@@ -710,11 +778,14 @@ def make_handler(state: DBAPIState):
             except ValueError as exc:
                 self._error(400, "bad_request", str(exc))
             except Exception as exc:  # noqa: BLE001
-                self._error(500, "internal_error", str(exc))
+                print(f"[db_api] PUT {parsed.path} failed: {exc}", flush=True)
+                self._internal_error()
 
         def do_DELETE(self):  # noqa: N802
             self._bind_correlation_id()
             if not self._auth():
+                return
+            if not self._check_rate_limit():
                 return
             parsed = urlparse(self.path)
             try:
@@ -726,7 +797,8 @@ def make_handler(state: DBAPIState):
             except ValueError as exc:
                 self._error(400, "bad_request", str(exc))
             except Exception as exc:  # noqa: BLE001
-                self._error(500, "internal_error", str(exc))
+                print(f"[db_api] DELETE {parsed.path} failed: {exc}", flush=True)
+                self._internal_error()
 
         def log_message(self, _format, *args):
             return

@@ -28,7 +28,7 @@ jobs:
       - name: Dependency vulnerability audit
         run: |
           python -m pip install --upgrade pip-audit
-          python -m pip_audit
+          pip-audit
 
       - name: Run health endpoint tests
         run: pytest -q tests/test_health_endpoint.py
